@@ -1,0 +1,59 @@
+// The service-boundary contract: the versioned artifact both the Go host and every
+// downstream module compile against. The host is a pure gRPC CLIENT; the module is a
+// pure gRPC SERVER with no inbound edge of its own (nothing reaches it except through
+// the host). A gRPC module is a FULL process — it owns its own data, clock, syscalls,
+// and language/runtime — so there is no host->module capability interface here.
+syntax = "proto3";
+package mycel.modulerpc.v1;
+
+option go_package = "github.com/cogniworks/mycel_module_sdk/contracts/modulerpc/v1;modulerpc";
+
+// Implemented by EVERY downstream service module.
+service ModuleHandler {
+  // Self-description: token, nav, menu-group, capabilities, contract version.
+  // The host calls this to build /api/app-config.
+  rpc Describe(DescribeRequest) returns (DescribeResponse);
+
+  // Primary entrypoint. The host routes inbound /m/<token>/* requests here.
+  rpc Handle(HandleRequest) returns (HandleResponse);
+
+  // Liveness/readiness probe used by the supervisor.
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message DescribeRequest {}
+message DescribeResponse {
+  string token            = 1;   // = route/nav prefix (/m/<token>)
+  string contract_version = 2;   // semver of this contract the module built against
+  string menu_group       = 3;   // sidebar header the module's nav appears under
+  repeated NavEntry nav   = 4;    // sidebar links, paths relative to /m/<token>
+  repeated string capabilities = 5;
+  string ui_entry         = 6;    // optional: module-declared UI bundle path (else from the resolved composition)
+}
+
+message NavEntry {
+  string label = 1;
+  string path  = 2;   // relative to /m/<token>
+}
+
+message HandleRequest {
+  string method = 1;
+  string path   = 2;                 // path under /m/<token> (prefix already stripped by host)
+  string query  = 3;
+  map<string,string> headers = 4;
+  bytes  body   = 5;
+  // tenant identity + trace context travel in gRPC METADATA, never in the body.
+}
+
+message HandleResponse {
+  uint32 status = 1;
+  map<string,string> headers = 2;
+  bytes  body   = 3;
+}
+
+message HealthRequest {}
+message HealthResponse {
+  enum Status { UNKNOWN = 0; SERVING = 1; NOT_SERVING = 2; }
+  Status status = 1;
+  string detail = 2;
+}
