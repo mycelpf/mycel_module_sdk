@@ -106,4 +106,25 @@ type Descriptor struct {
 	Migrations      []Migration  // ordered DDL, applied at boot when DATABASE_URL is set
 	Route           RouteFunc    // pure handler (SDK provides a tx-scoped Host)
 	Handler         http.Handler // OR an existing http.Handler (the SDK bridges gRPC↔HTTP)
+
+	// OpenAPI is the module's own OpenAPI 3.x document (JSON), returned verbatim on
+	// Describe. Paths are declared relative to the module's root (e.g. "/roles", NOT
+	// "/m/<token>/roles") — the host namespaces them under /m/<token> when it
+	// federates the app's single spec. Typically `//go:embed openapi.json`. Empty ⇒
+	// the host renders a generic passthrough operation for this module instead.
+	OpenAPI []byte
+
+	// Verify, if set, is a DEPLOY-TIME readiness gate the SDK runs at startup (with a
+	// few retries, since a wired collaborator may still be booting). Use it to enforce a
+	// contract this module REQUIRES of a collaborator it depends on — the canonical case
+	// being a BASE module verifying that a client's EXTENSION service honors the
+	// extension contract: probe it via Host.CallExt and validate the responses. Return
+	// nil when there is nothing to enforce (e.g. no extension wired — an unconfigured
+	// collaborator is a legitimate choice, not a breach). A non-nil error is FAIL-CLOSED:
+	// the SDK logs it loudly and holds the module NOT_SERVING (so k8s readiness keeps the
+	// whole app out of rotation) until a redeploy fixes it — a non-conformant collaborator
+	// takes the app down rather than silently degrading. The returned error's message
+	// should BE the human-readable conformance report. This is the strict gate; keep
+	// per-request RUNTIME CallExt calls best-effort.
+	Verify func(Host) error
 }

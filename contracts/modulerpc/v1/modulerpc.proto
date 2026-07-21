@@ -29,6 +29,10 @@ message DescribeResponse {
   repeated NavEntry nav   = 4;    // sidebar links, paths relative to /m/<token>
   repeated string capabilities = 5;
   string ui_entry         = 6;    // optional: module-declared UI bundle path (else from the resolved composition)
+  // The module's own OpenAPI 3.x document (JSON), with paths relative to its root
+  // (no /m/<token> prefix — the host namespaces them when it federates). Empty when
+  // the module ships no spec; the host then falls back to a generic passthrough op.
+  bytes openapi           = 7;
 }
 
 message NavEntry {

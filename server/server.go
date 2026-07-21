@@ -35,6 +35,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -143,7 +144,17 @@ func Serve(d modulesdk.Descriptor) {
 			Timeout:           10 * time.Second, // ...and drop it if the ping isn't answered
 		}),
 	)
-	modulerpc.RegisterModuleHandlerServer(srv, &handler{d: d, db: db, health: newHealthGate(db, d.Token)})
+	hg := newHealthGate(db, d.Token)
+	// Deploy-time conformance gate: hold the module NOT_SERVING until Descriptor.Verify
+	// passes, so a configured-but-non-conformant collaborator (e.g. a client extension
+	// that doesn't honor the contract) makes the whole app unready — fail-closed and
+	// loud — instead of silently degrading. Runs in the background so the gRPC server
+	// (incl. Health) is already up for k8s readiness probes to observe NOT_SERVING.
+	if d.Verify != nil {
+		hg.forceUnready("startup verification pending")
+		go runVerifyGate(d, hg)
+	}
+	modulerpc.RegisterModuleHandlerServer(srv, &handler{d: d, db: db, health: hg})
 	log.Printf("%s module serving gRPC on %s://%s", d.Token, network, address)
 
 	// Graceful shutdown: trap signals, drain, then clean up the DB + socket.
@@ -261,6 +272,7 @@ func (h *handler) Describe(context.Context, *modulerpc.DescribeRequest) (*module
 		MenuGroup:       h.d.MenuGroup,
 		Nav:             nav,
 		UiEntry:         h.d.UIEntry,
+		Openapi:         h.d.OpenAPI,
 	}, nil
 }
 
@@ -276,6 +288,14 @@ func (h *handler) Health(ctx context.Context, _ *modulerpc.HealthRequest) (*modu
 }
 
 func (h *handler) Handle(ctx context.Context, req *modulerpc.HandleRequest) (*modulerpc.HandleResponse, error) {
+	// Fail-closed: while the startup gate is held (e.g. a wired extension that doesn't
+	// honor the contract), the module refuses ALL traffic — not just signalling
+	// NOT_SERVING on Health, but actually not serving its routes — so a non-conformant
+	// collaborator makes the module unusable until it's fixed. Cleared gate ⇒ no cost.
+	if r := h.health.gate.Load(); r != nil {
+		return errResponse(503, "module not serving: startup verification failed (see module logs)"), nil
+	}
+
 	// http.Handler modules: bridge the gRPC request to ServeHTTP. The handler owns its
 	// own datastore, so the SDK applies no tx/search_path here (it still ran the
 	// module's migrations at boot).
@@ -410,15 +430,52 @@ type healthGate struct {
 	db    *sql.DB
 	token string // the module's schema — validated at scaffold time, safe to embed in SQL
 
+	// gate, when non-nil, forces NOT_SERVING regardless of the DB ping — it holds the
+	// reason (e.g. a failed startup Verify / extension-conformance report). This is how a
+	// fail-closed deploy gate keeps the module out of rotation until it's fixed.
+	gate atomic.Pointer[string]
+
 	mu         sync.Mutex
 	last       time.Time
 	serveOK    bool
 	lastPingMs float64
 }
 
+// forceUnready pins the gate to NOT_SERVING with a human-readable reason; ready() clears it.
+func (g *healthGate) forceUnready(reason string) { g.gate.Store(&reason) }
+func (g *healthGate) ready()                      { g.gate.Store(nil) }
+
+// runVerifyGate runs the module's startup Verify, retrying while a wired collaborator may
+// still be booting. On success the module goes READY; on persistent failure the
+// conformance report is logged LOUDLY and the module is pinned NOT_SERVING (fail-closed).
+func runVerifyGate(d modulesdk.Descriptor, hg *healthGate) {
+	const attempts = 12
+	const delay = 2 * time.Second
+	var host modulesdk.Host = noDBHost{}
+	for i := 1; ; i++ {
+		err := d.Verify(host)
+		if err == nil {
+			hg.ready()
+			log.Printf("%s: startup verification passed — module READY", d.Token)
+			return
+		}
+		if i >= attempts {
+			hg.forceUnready(err.Error())
+			bar := strings.Repeat("=", 72)
+			log.Printf("\n%s\n%s: STARTUP VERIFICATION FAILED — holding NOT_SERVING (fail-closed)\n%s\n%s",
+				bar, d.Token, err.Error(), bar)
+			return
+		}
+		time.Sleep(delay)
+	}
+}
+
 func newHealthGate(db *sql.DB, token string) *healthGate { return &healthGate{db: db, token: token} }
 
 func (g *healthGate) serving(ctx context.Context) bool {
+	if g.gate.Load() != nil {
+		return false // pinned NOT_SERVING by a failed startup gate (fail-closed)
+	}
 	ok, _ := g.check(ctx)
 	return ok
 }

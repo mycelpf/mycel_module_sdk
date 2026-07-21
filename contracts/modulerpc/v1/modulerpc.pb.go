@@ -120,8 +120,12 @@ type DescribeResponse struct {
 	Nav             []*NavEntry            `protobuf:"bytes,4,rep,name=nav,proto3" json:"nav,omitempty"`                                                // sidebar links, paths relative to /m/<token>
 	Capabilities    []string               `protobuf:"bytes,5,rep,name=capabilities,proto3" json:"capabilities,omitempty"`
 	UiEntry         string                 `protobuf:"bytes,6,opt,name=ui_entry,json=uiEntry,proto3" json:"ui_entry,omitempty"` // optional: module-declared UI bundle path (else from the resolved composition)
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// The module's own OpenAPI 3.x document (JSON), with paths relative to its root
+	// (no /m/<token> prefix — the host namespaces them when it federates). Empty when
+	// the module ships no spec; the host then falls back to a generic passthrough op.
+	Openapi       []byte `protobuf:"bytes,7,opt,name=openapi,proto3" json:"openapi,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *DescribeResponse) Reset() {
@@ -194,6 +198,13 @@ func (x *DescribeResponse) GetUiEntry() string {
 		return x.UiEntry
 	}
 	return ""
+}
+
+func (x *DescribeResponse) GetOpenapi() []byte {
+	if x != nil {
+		return x.Openapi
+	}
+	return nil
 }
 
 type NavEntry struct {
@@ -477,7 +488,7 @@ var File_contracts_modulerpc_v1_modulerpc_proto protoreflect.FileDescriptor
 const file_contracts_modulerpc_v1_modulerpc_proto_rawDesc = "" +
 	"\n" +
 	"&contracts/modulerpc/v1/modulerpc.proto\x12\x12mycel.modulerpc.v1\"\x11\n" +
-	"\x0fDescribeRequest\"\xe1\x01\n" +
+	"\x0fDescribeRequest\"\xfb\x01\n" +
 	"\x10DescribeResponse\x12\x14\n" +
 	"\x05token\x18\x01 \x01(\tR\x05token\x12)\n" +
 	"\x10contract_version\x18\x02 \x01(\tR\x0fcontractVersion\x12\x1d\n" +
@@ -485,7 +496,8 @@ const file_contracts_modulerpc_v1_modulerpc_proto_rawDesc = "" +
 	"menu_group\x18\x03 \x01(\tR\tmenuGroup\x12.\n" +
 	"\x03nav\x18\x04 \x03(\v2\x1c.mycel.modulerpc.v1.NavEntryR\x03nav\x12\"\n" +
 	"\fcapabilities\x18\x05 \x03(\tR\fcapabilities\x12\x19\n" +
-	"\bui_entry\x18\x06 \x01(\tR\auiEntry\"4\n" +
+	"\bui_entry\x18\x06 \x01(\tR\auiEntry\x12\x18\n" +
+	"\aopenapi\x18\a \x01(\fR\aopenapi\"4\n" +
 	"\bNavEntry\x12\x14\n" +
 	"\x05label\x18\x01 \x01(\tR\x05label\x12\x12\n" +
 	"\x04path\x18\x02 \x01(\tR\x04path\"\xeb\x01\n" +
@@ -516,7 +528,7 @@ const file_contracts_modulerpc_v1_modulerpc_proto_rawDesc = "" +
 	"\rModuleHandler\x12U\n" +
 	"\bDescribe\x12#.mycel.modulerpc.v1.DescribeRequest\x1a$.mycel.modulerpc.v1.DescribeResponse\x12O\n" +
 	"\x06Handle\x12!.mycel.modulerpc.v1.HandleRequest\x1a\".mycel.modulerpc.v1.HandleResponse\x12O\n" +
-	"\x06Health\x12!.mycel.modulerpc.v1.HealthRequest\x1a\".mycel.modulerpc.v1.HealthResponseBGZEgithub.com/cogniworks/mycel/app_core/contracts/modulerpc/v1;modulerpcb\x06proto3"
+	"\x06Health\x12!.mycel.modulerpc.v1.HealthRequest\x1a\".mycel.modulerpc.v1.HealthResponseBIZGgithub.com/cogniworks/mycel_module_sdk/contracts/modulerpc/v1;modulerpcb\x06proto3"
 
 var (
 	file_contracts_modulerpc_v1_modulerpc_proto_rawDescOnce sync.Once
