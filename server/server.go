@@ -39,8 +39,8 @@ import (
 	"syscall"
 	"time"
 
-	modulerpc "github.com/cogniworks/mycel_module_sdk/contracts/modulerpc/v1"
 	"github.com/cogniworks/mycel_module_sdk"
+	modulerpc "github.com/cogniworks/mycel_module_sdk/contracts/modulerpc/v1"
 
 	_ "github.com/lib/pq"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
@@ -443,7 +443,7 @@ type healthGate struct {
 
 // forceUnready pins the gate to NOT_SERVING with a human-readable reason; ready() clears it.
 func (g *healthGate) forceUnready(reason string) { g.gate.Store(&reason) }
-func (g *healthGate) ready()                      { g.gate.Store(nil) }
+func (g *healthGate) ready()                     { g.gate.Store(nil) }
 
 // runVerifyGate runs the module's startup Verify, retrying while a wired collaborator may
 // still be booting. On success the module goes READY; on persistent failure the
