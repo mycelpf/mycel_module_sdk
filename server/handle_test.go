@@ -47,6 +47,23 @@ func (c *fakeConn) ExecContext(context.Context, string, []driver.NamedValue) (dr
 	return driver.RowsAffected(0), nil
 }
 
+// QueryerContext serves the health gate's schema probe. It returns zero rows, which
+// database/sql surfaces as sql.ErrNoRows — what check() treats as "reachable and empty",
+// i.e. healthy. Without this, database/sql falls back to Prepare and the probe fails for
+// reasons that have nothing to do with what a test is asserting.
+func (c *fakeConn) QueryContext(ctx context.Context, _ string, _ []driver.NamedValue) (driver.Rows, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err // honour a live cancellation, so the detach test means something
+	}
+	return &emptyRows{}, nil
+}
+
+type emptyRows struct{}
+
+func (*emptyRows) Columns() []string         { return []string{"?column?"} }
+func (*emptyRows) Close() error              { return nil }
+func (*emptyRows) Next([]driver.Value) error { return io.EOF }
+
 type fakeTx struct{ d *fakeDriver }
 
 func (t *fakeTx) Commit() error   { return t.d.commitErr }

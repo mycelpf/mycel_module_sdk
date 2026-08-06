@@ -25,6 +25,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -365,7 +366,10 @@ func (h *handler) Handle(ctx context.Context, req *modulerpc.HandleRequest) (*mo
 	// NOT_SERVING on Health, but actually not serving its routes — so a non-conformant
 	// collaborator makes the module unusable until it's fixed. Cleared gate ⇒ no cost.
 	if r := h.health.gate.Load(); r != nil {
-		return errResponse(503, "module not serving: startup verification failed (see module logs)"), nil
+		// Carry the reason rather than pointing at the logs: the caller is often another
+		// module or the console, neither of which can read this process's stderr, and the
+		// gate is still retrying — so this is a "not yet", not a verdict.
+		return errResponse(503, "module not serving: startup verification failing — "+*r), nil
 	}
 
 	// http.Handler modules: bridge the gRPC request to ServeHTTP. The handler owns its
@@ -528,28 +532,70 @@ type healthGate struct {
 func (g *healthGate) forceUnready(reason string) { g.gate.Store(&reason) }
 func (g *healthGate) ready()                     { g.gate.Store(nil) }
 
-// runVerifyGate runs the module's startup Verify, retrying while a wired collaborator may
-// still be booting. On success the module goes READY; on persistent failure the
-// conformance report is logged LOUDLY and the module is pinned NOT_SERVING (fail-closed).
+// Verify-gate retry shape. The gate is fail-closed but NOT one-shot: it keeps probing
+// until it passes, so a collaborator that is fixed or finishes booting brings this module
+// back on its own.
+// vars, not consts, so tests can shrink the sleeps and exercise the control flow without
+// the clock (same reason the CLI's load simulator keeps its backoff knobs assignable).
+var (
+	verifyBackoffBase = 2 * time.Second
+	verifyBackoffMax  = 30 * time.Second
+	verifyLoudAfter   = 12              // ~22s of quiet grace before the banner
+	verifyRemindEvery = 5 * time.Minute // then a reminder at this cadence, not per attempt
+)
+
+// runVerifyGate runs the module's Verify until it passes, holding the module NOT_SERVING
+// meanwhile. It never gives up.
+//
+// It used to stop after 12 attempts (~22s) and pin the gate forever. Nothing cleared that
+// pin — there was no re-verify and no path back to ready() — so the module answered 503 on
+// EVERY route until a human redeployed it, and module pods carry no livenessProbe, so
+// nothing restarted them either. A collaborator that took 23 seconds to boot bricked its
+// base module. Since the failure modes that gate legitimately catches — a dependency still
+// booting, a dependency down, a dependency deployed non-conformant and then fixed — are
+// all repairable WITHOUT touching this module, giving up was never the right answer to any
+// of them; retrying is correct for all three and needs no way to tell them apart.
+//
+// Fail-closed is preserved: the module stays out of rotation the entire time it is failing.
 func runVerifyGate(d modulesdk.Descriptor, hg *healthGate) {
-	const attempts = 12
-	const delay = 2 * time.Second
 	var host modulesdk.Host = noDBHost{}
-	for i := 1; ; i++ {
+	delay := verifyBackoffBase
+	failed := false
+	lastLoud := time.Time{}
+
+	for attempt := 1; ; attempt++ {
 		err := d.Verify(host)
 		if err == nil {
 			hg.ready()
-			log.Printf("%s: startup verification passed — module READY", d.Token)
+			if failed {
+				log.Printf("%s: startup verification passed after %d attempts — module READY (recovered without a redeploy)", d.Token, attempt)
+			} else {
+				log.Printf("%s: startup verification passed — module READY", d.Token)
+			}
 			return
 		}
-		if i >= attempts {
-			hg.forceUnready(err.Error())
+
+		hg.forceUnready(err.Error())
+
+		// Loud once when it stops looking like ordinary boot lag, then only at a slow
+		// cadence: this loop runs forever, and a banner per attempt would bury the logs
+		// an operator needs to diagnose the collaborator.
+		if attempt == verifyLoudAfter || (failed && time.Since(lastLoud) >= verifyRemindEvery) {
 			bar := strings.Repeat("=", 72)
-			log.Printf("\n%s\n%s: STARTUP VERIFICATION FAILED — holding NOT_SERVING (fail-closed)\n%s\n%s",
+			log.Printf("\n%s\n%s: STARTUP VERIFICATION FAILING — holding NOT_SERVING (fail-closed), still retrying\n%s\n%s",
 				bar, d.Token, err.Error(), bar)
-			return
+			lastLoud = time.Now()
+			failed = true
 		}
-		time.Sleep(delay)
+
+		// Full jitter on a capped exponential, matching the analytics flusher: without it
+		// every module in the fleet re-probes a struggling collaborator in lockstep.
+		time.Sleep(time.Duration(rand.Int63n(int64(delay) + 1)))
+		if delay < verifyBackoffMax {
+			if delay *= 2; delay > verifyBackoffMax {
+				delay = verifyBackoffMax
+			}
+		}
 	}
 }
 
@@ -575,7 +621,13 @@ func (g *healthGate) check(ctx context.Context) (ok bool, pingMs float64) {
 	if time.Since(g.last) < healthPingTTL && !g.last.IsZero() {
 		return g.serveOK, g.lastPingMs
 	}
-	pctx, cancel := context.WithTimeout(ctx, time.Second)
+	// Detached from the caller's context on purpose. This verdict is CACHED for
+	// healthPingTTL and shared by every subsequent probe, so inheriting the caller meant
+	// one client hanging up mid-probe cancelled the query, recorded the module as
+	// NOT_SERVING, and served that answer to everyone for the next 2 seconds — a browser
+	// refresh could make a perfectly healthy module report itself down. The module's own
+	// readiness is not the caller's to cancel; only the 1s timeout bounds it.
+	pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
 	defer cancel()
 	start := time.Now()
 	// SELECT 1 FROM <token>._mycel_migrations — reaches the module's OWN schema, not
