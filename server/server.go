@@ -51,6 +51,7 @@ import (
 	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
 )
@@ -158,6 +159,9 @@ func Serve(d modulesdk.Descriptor) {
 		go runVerifyGate(d, hg)
 	}
 	modulerpc.RegisterModuleHandlerServer(srv, &handler{d: d, db: db, health: hg})
+	// The standard health service too, so k8s can probe this module natively — see
+	// health_grpc.go. Same gate, so the two answers can never disagree.
+	healthpb.RegisterHealthServer(srv, &grpcHealth{gate: hg})
 	log.Printf("%s module serving gRPC on %s://%s", d.Token, network, address)
 
 	// Graceful shutdown: trap signals, drain, then clean up the DB + socket.

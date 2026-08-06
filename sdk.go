@@ -111,10 +111,23 @@ type Descriptor struct {
 	Handler         http.Handler // OR an existing http.Handler (the SDK bridges gRPC↔HTTP)
 
 	// OpenAPI is the module's own OpenAPI 3.x document (JSON), returned verbatim on
-	// Describe. Paths are declared relative to the module's root (e.g. "/roles", NOT
-	// "/m/<token>/roles") — the host namespaces them under /m/<token> when it
-	// federates the app's single spec. Typically `//go:embed openapi.json`. Empty ⇒
-	// the host renders a generic passthrough operation for this module instead.
+	// Describe and spliced into the app's single federated spec.
+	//
+	// Declare paths ALREADY PREFIXED with /m/<token> — "/m/roles/roles", not "/roles".
+	// The federated spec is served at the host's origin, so an unprefixed path advertises
+	// a URL that does not exist: the operation resolves to /roles when the host actually
+	// serves it at /m/<token>/roles, and "Try it" in the API docs 404s. Namespace
+	// components.schemas and operationIds by token too — every module's fragment merges
+	// into ONE paths map and ONE schemas map, so a bare "task" or "getHealth" from two
+	// modules silently overwrites the other.
+	//
+	// (This comment previously said the opposite — that paths were relative and the host
+	// prefixed them. It never did; it splices fragments verbatim. Four of five modules
+	// followed the prefixed convention and one followed this doc, which is exactly the
+	// bug that convention drift produces.)
+	//
+	// Typically `//go:embed openapi.json`. Empty ⇒ the host renders a generic passthrough
+	// operation for this module instead.
 	OpenAPI []byte
 
 	// Verify, if set, is a DEPLOY-TIME readiness gate the SDK runs at startup (with a
