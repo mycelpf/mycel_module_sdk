@@ -1,6 +1,6 @@
 // Package modulesdk is the shared module SDK — the single definition of the types and
 // the seam every mycel gRPC module is built against. It is the root package of the
-// standalone module github.com/cogniworks/mycel_module_sdk, imported (not copied) by
+// standalone module github.com/mycelpf/mycel_module_sdk, imported (not copied) by
 // each module, alongside its sibling packages ./server (transport glue) and
 // ./contracts/modulerpc/v1 (the host↔module wire contract). This module replaced the
 // per-module vendored copies that used to drift apart.

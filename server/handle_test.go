@@ -11,8 +11,8 @@ import (
 	"strings"
 	"testing"
 
-	modulesdk "github.com/cogniworks/mycel_module_sdk"
-	modulerpc "github.com/cogniworks/mycel_module_sdk/contracts/modulerpc/v1"
+	modulesdk "github.com/mycelpf/mycel_module_sdk"
+	modulerpc "github.com/mycelpf/mycel_module_sdk/contracts/modulerpc/v1"
 	"google.golang.org/grpc"
 )
 

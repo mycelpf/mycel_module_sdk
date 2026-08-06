@@ -1,4 +1,4 @@
-module github.com/cogniworks/mycel_module_sdk
+module github.com/mycelpf/mycel_module_sdk
 
 go 1.26
 

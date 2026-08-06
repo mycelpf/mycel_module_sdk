@@ -528,7 +528,7 @@ const file_contracts_modulerpc_v1_modulerpc_proto_rawDesc = "" +
 	"\rModuleHandler\x12U\n" +
 	"\bDescribe\x12#.mycel.modulerpc.v1.DescribeRequest\x1a$.mycel.modulerpc.v1.DescribeResponse\x12O\n" +
 	"\x06Handle\x12!.mycel.modulerpc.v1.HandleRequest\x1a\".mycel.modulerpc.v1.HandleResponse\x12O\n" +
-	"\x06Health\x12!.mycel.modulerpc.v1.HealthRequest\x1a\".mycel.modulerpc.v1.HealthResponseBIZGgithub.com/cogniworks/mycel_module_sdk/contracts/modulerpc/v1;modulerpcb\x06proto3"
+	"\x06Health\x12!.mycel.modulerpc.v1.HealthRequest\x1a\".mycel.modulerpc.v1.HealthResponseBFZDgithub.com/mycelpf/mycel_module_sdk/contracts/modulerpc/v1;modulerpcb\x06proto3"
 
 var (
 	file_contracts_modulerpc_v1_modulerpc_proto_rawDescOnce sync.Once

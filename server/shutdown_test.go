@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	modulesdk "github.com/cogniworks/mycel_module_sdk"
+	modulesdk "github.com/mycelpf/mycel_module_sdk"
 )
 
 // The order in cleanup is load-bearing: the hook runs after the gRPC server has stopped

@@ -6,7 +6,7 @@
 syntax = "proto3";
 package mycel.modulerpc.v1;
 
-option go_package = "github.com/cogniworks/mycel_module_sdk/contracts/modulerpc/v1;modulerpc";
+option go_package = "github.com/mycelpf/mycel_module_sdk/contracts/modulerpc/v1;modulerpc";
 
 // Implemented by EVERY downstream service module.
 service ModuleHandler {

@@ -1,6 +1,6 @@
 # mycel_module_sdk
 
-`github.com/cogniworks/mycel_module_sdk` — the **single definition of the seam every
+`github.com/mycelpf/mycel_module_sdk` — the **single definition of the seam every
 mycel gRPC module is built against**: the plain types a module's logic speaks, the
 transport glue that serves it, and the host↔module wire contract. Modules *import* it
 (never copy it), which is what stops the per-module definitions from drifting apart.
@@ -86,17 +86,27 @@ status `< 500` and rolls back on a `5xx` or any failed statement. Always pass va
 
 ## Consumption
 
-Consumed via a `replace` to a sibling checkout — the **primary, indefinite** mechanism
-(same convention as [`mycel_release`](../mycel_release)):
+This module is **published publicly** — a module anywhere on disk resolves it the
+ordinary way, with no sibling checkout and no workspace layout requirement:
 
 ```
-require github.com/cogniworks/mycel_module_sdk v0.0.0
-replace github.com/cogniworks/mycel_module_sdk => ../../../../mycel_module_sdk
+require github.com/mycelpf/mycel_module_sdk v0.1.0
+```
+
+That is what `mycel init` emits, and it is why a scaffolded module no longer carries a
+copy of this SDK inside it. Copies drift; a version does not.
+
+Inside this workspace the six first-party modules additionally pin a `replace` to the
+sibling checkout, so a change here is visible to them without a release:
+
+```
+replace github.com/mycelpf/mycel_module_sdk => ../../../../mycel_module_sdk
 ```
 
 (The `../` depth depends on the consumer's location — e.g. a module's `module/service/`.)
-Because a module's Docker build can't resolve that local `replace`, the release pipeline
-runs `go mod vendor` around the build; see `mycel_app_core_modules/RELEASE.md`.
+A `replace` cannot resolve inside a build container, so the release pipeline runs
+`go mod vendor` around those builds; see `mycel_app_core_modules/RELEASE.md`. Consumers
+outside the workspace need none of this.
 
 ## Who builds against it
 

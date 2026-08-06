@@ -39,8 +39,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cogniworks/mycel_module_sdk"
-	modulerpc "github.com/cogniworks/mycel_module_sdk/contracts/modulerpc/v1"
+	"github.com/mycelpf/mycel_module_sdk"
+	modulerpc "github.com/mycelpf/mycel_module_sdk/contracts/modulerpc/v1"
 
 	_ "github.com/lib/pq"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
