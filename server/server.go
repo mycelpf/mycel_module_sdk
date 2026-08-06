@@ -47,8 +47,10 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/status"
 )
 
 // defaultSocketDir is the consistent per-federation socket location. `mycel run`
@@ -131,6 +133,7 @@ func Serve(d modulesdk.Descriptor) {
 	srv := grpc.NewServer(
 		grpc.MaxRecvMsgSize(maxMsgBytes),
 		grpc.MaxSendMsgSize(maxMsgBytes),
+		grpc.ChainUnaryInterceptor(recoverUnary(d.Token)),
 		grpc.StatsHandler(otelgrpc.NewServerHandler()),
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 			MinTime:             5 * time.Second, // reject clients pinging faster than this
@@ -284,6 +287,44 @@ func applyMigrations(db *sql.DB, d modulesdk.Descriptor) error {
 	return nil
 }
 
+// recoverUnary turns a panic in module code into one failed request instead of a dead
+// module. grpc-go does NOT recover handler panics, so without this a single bad input
+// unwinds past Serve and kills the process — taking every concurrent in-flight request
+// with it, and skipping Descriptor.Shutdown, so an analytics queue is lost rather than
+// drained. It is worse for Descriptor.Handler modules: under a real net/http server a
+// handler panic costs one connection, but bridgeHTTP routes it through this gRPC
+// handler, so the same panic became fatal on being mounted as a module.
+//
+// sdk.go asserts Route "never panics on bad input". This is what makes that assertion
+// survivable when it turns out to be false.
+func recoverUnary(token string) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, next grpc.UnaryHandler) (resp any, err error) {
+		defer func() {
+			r := recover()
+			if r == nil {
+				return
+			}
+			buf := make([]byte, 8192)
+			buf = buf[:runtime.Stack(buf, false)]
+			log.Printf("%s: PANIC in %s: %v\n%s", token, info.FullMethod, r, buf)
+
+			// Handle answers in HTTP terms, so give the caller a real 500 rather than a
+			// transport error the host would render as 502 "module unreachable" — the
+			// module is up; one route misbehaved, and that distinction is the whole
+			// difference between "redeploy" and "look at this handler".
+			if info.FullMethod == handleFullMethod {
+				resp, err = errResponse(500, "internal error"), nil
+				return
+			}
+			resp, err = nil, status.Errorf(codes.Internal, "panic in %s", info.FullMethod)
+		}()
+		return next(ctx, req)
+	}
+}
+
+// handleFullMethod is the one RPC whose reply carries an HTTP status of its own.
+const handleFullMethod = "/mycel.modulerpc.v1.ModuleHandler/Handle"
+
 // handler implements ModuleHandler by delegating to the Descriptor's pure Route.
 type handler struct {
 	modulerpc.UnimplementedModuleHandlerServer
@@ -369,8 +410,12 @@ func (h *handler) Handle(ctx context.Context, req *modulerpc.HandleRequest) (*mo
 		if err != nil {
 			return errResponse(500, "db begin"), nil
 		}
+		// Backstop for the panic path: recoverUnary turns a panic in Route into a 500,
+		// but the transaction below is already open at that point and nothing else would
+		// ever release its pool connection. Rollback after a Commit is ErrTxDone — a
+		// no-op — so this is safe on every path, not just the panicking one.
+		defer t.Rollback()
 		if _, err := t.ExecContext(ctx, "SET LOCAL search_path TO "+h.d.Token); err != nil { // token validated
-			t.Rollback()
 			return errResponse(500, "search_path"), nil
 		}
 		tx, host = t, &txHost{ctx: ctx, tx: t}
@@ -380,9 +425,16 @@ func (h *handler) Handle(ctx context.Context, req *modulerpc.HandleRequest) (*mo
 
 	if tx != nil {
 		if resp.Status < 500 {
-			_ = tx.Commit()
+			// The commit error is the answer, not a detail to drop. A connection that
+			// dies during COMMIT — precisely what a Postgres failover produces — rolls
+			// the transaction back; returning the route's 200 there tells the caller a
+			// write succeeded that does not exist.
+			if err := tx.Commit(); err != nil {
+				log.Printf("%s: commit failed after %d on %s %s: %v", h.d.Token, resp.Status, lr.Method, lr.Path, err)
+				return errResponse(500, "commit failed — the request was not applied"), nil
+			}
 		} else {
-			_ = tx.Rollback()
+			_ = tx.Rollback() // already failing; the rollback error adds nothing
 		}
 	}
 
