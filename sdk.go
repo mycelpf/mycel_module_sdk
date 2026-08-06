@@ -18,7 +18,10 @@
 // is the module's OWN per-request datastore handle, not something the host injects.
 package modulesdk
 
-import "net/http"
+import (
+	"context"
+	"net/http"
+)
 
 // Request is one inbound request, in plain types (no contract bindings). The server
 // adapter builds it from the gRPC HandleRequest; the path already has the
@@ -127,4 +130,23 @@ type Descriptor struct {
 	// should BE the human-readable conformance report. This is the strict gate; keep
 	// per-request RUNTIME CallExt calls best-effort.
 	Verify func(Host) error
+
+	// Shutdown, if set, is the module's OWN graceful-stop hook — for in-process state
+	// the SDK cannot know about, most importantly a background queue. The SDK runs it
+	// AFTER GracefulStop, so no handler can still be enqueueing into something you are
+	// already draining, and BEFORE the datastore is closed and the socket removed, so
+	// the hook may still use the DB.
+	//
+	// WHY THIS EXISTS: GracefulStop drains in-flight RPCs and nothing else. A handler
+	// that only did a channel send finishes in microseconds, so without this hook the
+	// process exits with the queue still in memory — events that Emit already accepted,
+	// that no drop counter recorded, and that no error surfaced anywhere. Invisible in
+	// dev (you rarely restart under load), permanent in production (every rolling
+	// deploy, scale-down and HPA scale-in).
+	//
+	// The ctx carries a bounded deadline (MYCEL_SHUTDOWN_TIMEOUT_MS, default 8000 —
+	// under k8s' default 30s grace period even after shutdownGrace). A returned error
+	// is logged, not fatal: the process is exiting either way, so the error's job is to
+	// leave a trace of what could not be delivered.
+	Shutdown func(context.Context) error
 }

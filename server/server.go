@@ -124,11 +124,9 @@ func Serve(d modulesdk.Descriptor) {
 	if err != nil {
 		log.Printf("%s: telemetry init: %v (continuing without traces)", d.Token, err)
 	}
-	defer func() {
-		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = shutdownTel(sctx)
-	}()
+	// Flushed in cleanup(), not deferred: the serve-error branch exits via os.Exit, which
+	// skips defers — and dropping the last batch of spans is exactly what you need when
+	// diagnosing why serve failed.
 
 	srv := grpc.NewServer(
 		grpc.MaxRecvMsgSize(maxMsgBytes),
@@ -167,7 +165,11 @@ func Serve(d modulesdk.Descriptor) {
 	select {
 	case err := <-errCh:
 		if err != nil {
-			log.Fatalf("%s: serve: %v", d.Token, err)
+			// NOT log.Fatalf: os.Exit would skip the module's Shutdown hook (losing
+			// whatever it had queued) and the telemetry flush. Clean up, then exit 1.
+			log.Printf("%s: serve: %v", d.Token, err)
+			cleanup(d, db, network, address, shutdownTel)
+			os.Exit(1)
 		}
 	case sig := <-sigCh:
 		log.Printf("%s: %v received, draining…", d.Token, sig)
@@ -181,11 +183,40 @@ func Serve(d modulesdk.Descriptor) {
 		}
 	}
 
+	cleanup(d, db, network, address, shutdownTel)
+}
+
+// cleanup is the ONE shutdown path, run from both the signal branch and the serve-error
+// branch. The order is load-bearing:
+//
+//	GracefulStop (already done by the caller) → Descriptor.Shutdown → db.Close → socket
+//
+// Shutdown runs only once the gRPC server has stopped accepting, so a handler cannot
+// enqueue into a queue that is already draining; and before db.Close, so the hook may
+// still write (e.g. flushing to its own datastore).
+func cleanup(d modulesdk.Descriptor, db *sql.DB, network, address string, flushTel telemetryShutdown) {
+	if d.Shutdown != nil {
+		to := time.Duration(intEnv("MYCEL_SHUTDOWN_TIMEOUT_MS", 8000)) * time.Millisecond
+		// context.Background(), not any inherited ctx: the signal has already fired, so
+		// every request-scoped context is cancelled and the hook would get no time at all.
+		sctx, cancel := context.WithTimeout(context.Background(), to)
+		if err := d.Shutdown(sctx); err != nil {
+			// Not fatal — the process is exiting regardless. The error exists to leave a
+			// trace of what could NOT be delivered, which is the whole point of the hook.
+			log.Printf("%s: shutdown hook: %v", d.Token, err)
+		}
+		cancel()
+	}
 	if db != nil {
 		_ = db.Close()
 	}
 	if network == "unix" {
 		_ = os.Remove(address)
+	}
+	if flushTel != nil {
+		tctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = flushTel(tctx)
+		cancel()
 	}
 	log.Printf("%s: stopped", d.Token)
 }
@@ -560,6 +591,18 @@ func (h *txHost) CallExt(envKey, method, path string, body []byte) (uint16, []by
 
 // --- extension hooks: a base module delegates client-specific decisions to an
 // extension service over gRPC (the same primitive the host uses to dial modules). ---
+
+// CallExt is Host.CallExt for callers that have no Host — a BACKGROUND goroutine.
+// Host is per-request; a queue flusher or a rollup ticker outlives every request and
+// still needs the same module→module dial, with the same connection pool and the same
+// semantics (status is the target's HTTP-ish status, so a non-2xx returns err == nil;
+// configured=false means the env var is unset, not a failure).
+//
+// It exists so a package like ./analytics can take a transport as a plain func value
+// and never import this package — keeping it free of gRPC and testable with a fake.
+func CallExt(ctx context.Context, envKey, method, path string, body []byte) (uint16, []byte, bool, error) {
+	return callExt(ctx, envKey, method, path, body)
+}
 
 var (
 	extMu    sync.Mutex

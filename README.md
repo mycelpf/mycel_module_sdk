@@ -44,7 +44,37 @@ its main.go       →  import "…/mycel_module_sdk/server"   // server.Serve(mo
 |---|---|
 | `.` (`modulesdk`, [sdk.go](sdk.go)) | **pure** types + the `Host` seam. `Request`/`Response`/`Row`/`RouteFunc`/`Descriptor`, and `Host` (the per-request datastore interface). |
 | `./server` | transport glue — `server.Serve(Descriptor{…})` adapts gRPC `HandleRequest` to the pure types, implements `Host` over a `*sql.Tx`, adds peer-cred + telemetry. |
+| `./analytics` | **stdlib-only** business-event + KPI client: `Emit` (non-blocking), the queue + flusher, and `KPI` reads. Takes its transport as a func value, so it imports neither gRPC nor `./server`. |
 | `./contracts/modulerpc/v1` | the host↔module gRPC wire contract. |
+
+### Business events (`./analytics`)
+
+A module emits at a business state transition; the client queues in-process and a
+background flusher delivers batches to the `mycel_kpi` module over `server.CallExt` (a
+direct module→module dial — the host is not involved). `Emit` takes no context and
+returns no error, because both would put analytics back in the OLTP path.
+
+```go
+an := analytics.New(analytics.Config{Service: "acme", Transport: server.CallExt})
+…
+an.Emit(analytics.Event{
+    Type: "OrderSubmitted", SubjectType: "order", SubjectID: id,
+    Attrs: map[string]string{"customer_tier": tier},
+    Nums:  map[string]float64{"weight": w},
+}.WithHeaders(req.Headers))   // actor_id + trace_id come from the request
+```
+
+**Wire `Shutdown`, or every deploy loses events.** `GracefulStop` drains in-flight RPCs
+and knows nothing about the queue, so without the hook the process exits with events that
+`Emit` already accepted, that no counter recorded, and that no error reported — invisible
+in dev, permanent in production:
+
+```go
+server.Serve(modulesdk.Descriptor{…, Shutdown: an.Shutdown})
+```
+
+Unset `MYCEL_KPI_URL` disables the client entirely (no goroutine, no retries), so an app
+running without a kpi module costs nothing.
 
 ### The transaction model (the one rule to remember)
 
