@@ -48,6 +48,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
@@ -211,6 +212,10 @@ func cleanup(d modulesdk.Descriptor, db *sql.DB, network, address string, flushT
 		}
 		cancel()
 	}
+	// After the hook, which may itself have used CallExt to drain (the analytics client
+	// does exactly that), and before the process goes: nothing had ever closed these, so
+	// they were left to process exit.
+	closeExtConns()
 	if db != nil {
 		_ = db.Close()
 	}
@@ -708,46 +713,126 @@ func CallExt(ctx context.Context, envKey, method, path string, body []byte) (uin
 	return callExt(ctx, envKey, method, path, body)
 }
 
-var (
-	extMu    sync.Mutex
-	extConns = map[string]modulerpc.ModuleHandlerClient{}
-)
+// extConns pools one multiplexed connection per extension address. A sync.Map, not a
+// mutex-guarded map: this is on the request path of every module that wires an
+// extension, and a single process-wide lock taken per call serialized all of them —
+// including calls to different targets. The host removed exactly this contention from
+// its own dialer; the SDK had kept it.
+var extConns sync.Map // addr → *grpc.ClientConn
+
+// extCallTimeout bounds one extension hop. Overridable because it has to fit INSIDE the
+// caller's own budget: the host allows a module 5s total (MYCEL_HANDLE_TIMEOUT), so an
+// extension hop that also takes 5s guarantees the host times out first and the module
+// never gets to answer gracefully.
+var extCallTimeout = envDuration("MYCEL_EXT_TIMEOUT_MS", 3*time.Second)
+
+// extDialOptions mirrors the host's hardened dial set. Two of these were missing here
+// and their absence is a recovery bug, not a tuning preference:
+//
+//   - Keepalive: without it a half-open connection (a NAT/conntrack eviction, a pod that
+//     vanished without a FIN) is only discovered when a call burns its whole timeout.
+//   - ConnectParams: grpc-go's default reconnect backoff climbs to 120 SECONDS and
+//     nothing resets it, so an extension that came back stayed unreachable for minutes.
+//
+// The retry policy covers UNAVAILABLE only. That code means the RPC did not reach a
+// server — no ready subchannel, connection refused, or the transport went away before
+// the request was sent — so replaying it does not risk double-applying anything. Codes
+// that mean the server DID see it are deliberately excluded.
+func extDialOptions() []grpc.DialOption {
+	return []grpc.DialOption{
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                10 * time.Second,
+			Timeout:             3 * time.Second,
+			PermitWithoutStream: true,
+		}),
+		grpc.WithConnectParams(grpc.ConnectParams{
+			Backoff: backoff.Config{
+				BaseDelay: 1 * time.Second, Multiplier: 1.6, Jitter: 0.2,
+				MaxDelay: 15 * time.Second,
+			},
+			MinConnectTimeout: 5 * time.Second,
+		}),
+		grpc.WithDefaultServiceConfig(`{
+  "methodConfig": [{
+    "name": [{"service": "mycel.modulerpc.v1.ModuleHandler", "method": "Handle"}],
+    "retryPolicy": {
+      "maxAttempts": 3,
+      "initialBackoff": "0.1s",
+      "maxBackoff": "1s",
+      "backoffMultiplier": 2.0,
+      "retryableStatusCodes": ["UNAVAILABLE"]
+    }
+  }]
+}`),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(maxMsgBytes),
+			grpc.MaxCallSendMsgSize(maxMsgBytes),
+		),
+	}
+}
 
 // callExt dials the extension service at the URL in os.Getenv(envKey) (a ModuleHandler
 // backend) and calls Handle{method, path, body}. configured=false when the env var is
 // unset (no extension wired). Connections are pooled per address. The parent context
 // bounds the call so a host cancel/deadline propagates to the extension hop.
+//
+// Note for callers: a non-2xx from the extension comes back with err == nil, because the
+// status is the TARGET's HTTP-ish status, not a transport failure. Check it. Silently
+// treating a 503 as "no answer" is how a transient blip turns into an identity minted
+// without its enriched roles — which is why a failure here is logged rather than dropped.
 func callExt(parent context.Context, envKey, method, path string, body []byte) (uint16, []byte, bool, error) {
 	addr := os.Getenv(envKey)
 	if addr == "" {
 		return 0, nil, false, nil
 	}
-	extMu.Lock()
-	cl := extConns[addr]
-	if cl == nil {
-		conn, err := grpc.NewClient(strings.TrimPrefix(addr, "grpc://"),
-			grpc.WithTransportCredentials(insecure.NewCredentials()),
-			grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
-			grpc.WithDefaultCallOptions(
-				grpc.MaxCallRecvMsgSize(maxMsgBytes),
-				grpc.MaxCallSendMsgSize(maxMsgBytes),
-			),
-		)
-		if err != nil {
-			extMu.Unlock()
-			return 0, nil, true, err
-		}
-		cl = modulerpc.NewModuleHandlerClient(conn)
-		extConns[addr] = cl
+	cl, err := extClient(addr)
+	if err != nil {
+		log.Printf("ext %s: dial %s: %v", envKey, addr, err)
+		return 0, nil, true, err
 	}
-	extMu.Unlock()
-	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
+	ctx, cancel := context.WithTimeout(parent, extCallTimeout)
 	defer cancel()
 	resp, err := cl.Handle(ctx, &modulerpc.HandleRequest{Method: method, Path: path, Body: body})
 	if err != nil {
+		// Log it: the callers of this are best-effort by design (an unreachable
+		// extension leaves the base identity untouched), so without a line here a
+		// degraded answer is indistinguishable from a correct one.
+		log.Printf("ext %s: %s %s failed: %v", envKey, method, path, err)
 		return 0, nil, true, err
 	}
 	return uint16(resp.GetStatus()), resp.GetBody(), true, nil
+}
+
+// extClient returns the pooled client for addr, dialing on first use. The hot path is a
+// lock-free map read; a construction race is cheap because grpc.NewClient does not
+// connect, so the loser just closes its unused conn.
+func extClient(addr string) (modulerpc.ModuleHandlerClient, error) {
+	if v, ok := extConns.Load(addr); ok {
+		return modulerpc.NewModuleHandlerClient(v.(*grpc.ClientConn)), nil
+	}
+	conn, err := grpc.NewClient(strings.TrimPrefix(addr, "grpc://"), extDialOptions()...)
+	if err != nil {
+		return nil, err
+	}
+	if actual, loaded := extConns.LoadOrStore(addr, conn); loaded {
+		_ = conn.Close()
+		conn = actual.(*grpc.ClientConn)
+	}
+	return modulerpc.NewModuleHandlerClient(conn), nil
+}
+
+// closeExtConns closes every pooled extension connection. Called from cleanup so a
+// draining module releases them instead of leaving sockets to the process exit.
+func closeExtConns() {
+	extConns.Range(func(k, v any) bool {
+		if c, ok := v.(*grpc.ClientConn); ok {
+			_ = c.Close()
+		}
+		extConns.Delete(k)
+		return true
+	})
 }
 
 // noDBHost is the host when DATABASE_URL is unset: static routes work; data routes
@@ -855,6 +940,16 @@ func envOr(key, def string) string {
 func intEnv(key string, def int) int {
 	if v, err := strconv.Atoi(os.Getenv(key)); err == nil && v > 0 {
 		return v
+	}
+	return def
+}
+
+// envDuration reads a positive millisecond env var as a Duration, falling back on
+// unset/invalid — a timeout you cannot change without cutting a release is a timeout you
+// cannot change during an incident.
+func envDuration(key string, def time.Duration) time.Duration {
+	if ms := intEnv(key, 0); ms > 0 {
+		return time.Duration(ms) * time.Millisecond
 	}
 	return def
 }
