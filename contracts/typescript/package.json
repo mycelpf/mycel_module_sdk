@@ -1,0 +1,26 @@
+{
+	"name": "@mycelpf/module-contract",
+	"version": "0.2.0",
+	"private": true,
+	"description": "Host JSON types and validators of the mycel module contract, generated from contracts/modulerpc/v1.",
+	"license": "Apache-2.0",
+	"type": "module",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		}
+	},
+	"scripts": {
+		"build": "tsc -p tsconfig.build.json",
+		"check": "tsc -p tsconfig.json",
+		"test": "node --test --experimental-strip-types \"test/*.test.ts\""
+	},
+	"devDependencies": {
+		"@types/node": "22.20.5",
+		"typescript": "5.9.3"
+	},
+	"files": [
+		"dist"
+	]
+}

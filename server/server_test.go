@@ -7,14 +7,13 @@ import (
 	"testing"
 )
 
-// TestErrResponse pins that the error envelope is always VALID JSON — including when
-// the message carries a quote or backslash (e.g. a pq error naming a "quoted"
-// identifier). The old string-concatenated body produced un-parseable JSON in exactly
-// that case; this is the shared SDK, so every module inherits the fix.
+// TestErrResponse pins that the error envelope (sdk.md S8) is always VALID JSON —
+// including when the message carries a quote or backslash. The old string-concatenated
+// body produced un-parseable JSON in exactly that case.
 func TestErrResponse(t *testing.T) {
 	cases := []string{"boom", `bad "quoted" value`, `path C:\temp\x`, "line1\nline2"}
 	for _, msg := range cases {
-		r := errResponse(500, msg)
+		r := errResponse(500, "internal_error", msg, "4bf92f3577b34da6a3ce929d0e0e4736")
 		if r.Status != 500 {
 			t.Errorf("status = %d, want 500", r.Status)
 		}
@@ -25,8 +24,8 @@ func TestErrResponse(t *testing.T) {
 		if err := json.Unmarshal(r.Body, &got); err != nil {
 			t.Fatalf("errResponse(%q) body is not valid JSON: %v (body: %s)", msg, err, r.Body)
 		}
-		if got["error"] != msg {
-			t.Errorf("round-trip: got %q, want %q", got["error"], msg)
+		if got["message"] != msg || got["code"] != "internal_error" || got["traceId"] != "4bf92f3577b34da6a3ce929d0e0e4736" {
+			t.Errorf("round-trip: got %v, want message %q", got, msg)
 		}
 	}
 }

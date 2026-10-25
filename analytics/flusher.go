@@ -80,12 +80,12 @@ func (c *Client) flush(ctx context.Context, batch []Event, draining bool) []Even
 	}
 	c.inFlight.Store(int64(len(batch)))
 	err := c.deliver(ctx, batch, draining)
-	c.inFlight.Store(0)
 
 	switch {
 	case err == nil, errors.Is(err, errRejected), errors.Is(err, errNotConfigured):
 		// Already counted by deliver.
 	case errors.Is(err, errStopping):
+		c.inFlight.Store(0)
 		return batch // keep it; drain() will try once more under its deadline
 	default:
 		// Deadline or cancellation, i.e. the drain ran out of time. Unrecoverable — the
@@ -94,6 +94,7 @@ func (c *Client) flush(ctx context.Context, batch []Event, draining bool) []Even
 		c.dropped.Add(uint64(len(batch)))
 		c.cfg.Log("error", fmt.Sprintf("analytics: %d event(s) undelivered: %v", len(batch), err))
 	}
+	c.inFlight.Store(0)
 	return batch[:0]
 }
 
@@ -129,6 +130,7 @@ func (c *Client) deliver(ctx context.Context, batch []Event, draining bool) erro
 		status, out, configured, terr := c.cfg.Transport(ctx, c.envKey, "POST", eventsPath, body)
 		switch {
 		case !configured:
+			c.discarded.Add(uint64(len(batch)))
 			c.cfg.Log("warn", "analytics: "+c.envKey+" is unset — discarding batch")
 			return errNotConfigured
 		case terr == nil && status >= 200 && status < 300:

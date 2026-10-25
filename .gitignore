@@ -1,1 +1,62 @@
 vendor/
+# Build output of the TypeScript contract package.
+contracts/typescript/dist/
+
+# --- Baseline shared by every mycel_* repo (keep in sync) ---
+# Build output. `go build ./2_distro/<name>` writes the binary at the repo root; its
+# name is listed above or below as /<name>.
+/bin/
+/dist/
+*.test
+*.out
+*.prof
+coverage*.out
+coverage*.html
+
+# Local Go workspace. Cross-repo development uses go_workspace/go.work, one level up.
+/go.work
+/go.work.sum
+
+# Web tooling. A shell's committed dist/ is embedded with //go:embed; only dependencies,
+# caches and test output are ignored.
+node_modules/
+.svelte-kit/
+npm-debug.log*
+test-results/
+playwright-report/
+
+# Python tooling.
+.venv/
+__pycache__/
+.pytest_cache/
+
+# cartograph's SQLite index and agent worktrees (full copies of this repo inside it).
+.mycel/
+.claude/worktrees/
+.claude/settings.local.json
+
+# Secrets and local config.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.local
+
+# OpenTofu state and plans. Can hold secrets; never source.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+
+# Editors, notes and OS.
+.DS_Store
+.idea/
+.vscode/
+.obsidian/
+*.swp
+*~
+
+# Rust build output
+rust/target/

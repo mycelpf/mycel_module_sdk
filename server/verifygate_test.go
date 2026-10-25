@@ -45,17 +45,16 @@ func TestVerifyGateRecoversOnceTheCollaboratorComesUp(t *testing.T) {
 	hg := newHealthGate(nil, "testmod")
 	hg.forceUnready("startup verification pending")
 
-	done := make(chan struct{})
-	go func() { runVerifyGate(d, hg); close(done) }()
+	done := make(chan bool, 1)
+	go func() { done <- runVerifyGate(context.Background(), d, hg, 0) }()
 
 	select {
-	case <-done:
+	case passed := <-done:
+		if !passed {
+			t.Error("runVerifyGate reported failure after Verify started passing")
+		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("runVerifyGate never returned — it gave up or wedged")
-	}
-
-	if !hg.serving(context.Background()) {
-		t.Error("the module is still NOT_SERVING after Verify started passing")
 	}
 	if got := calls.Load(); got < 20 {
 		t.Errorf("Verify ran %d times, want at least 20 — it stopped retrying too early", got)
@@ -77,7 +76,7 @@ func TestVerifyGateHoldsNotServingWhileFailing(t *testing.T) {
 	hg.forceUnready("startup verification pending")
 
 	done := make(chan struct{})
-	go func() { runVerifyGate(d, hg); close(done) }()
+	go func() { runVerifyGate(context.Background(), d, hg, 0); close(done) }()
 
 	if hg.serving(context.Background()) {
 		t.Error("the module served while its startup gate was unresolved")
@@ -89,14 +88,15 @@ func TestVerifyGateHoldsNotServingWhileFailing(t *testing.T) {
 	<-done
 }
 
-// The 503 must carry the reason. The caller is usually another module or the console,
-// neither of which can read this process's stderr.
-func TestGatedHandleReportsTheReason(t *testing.T) {
+// SDK-T7 and SDK-T18 (sdk.md S3, S8): a gated Handle answers 503 with the stable
+// verification_pending code and a fixed message. The verification report can name
+// collaborators, addresses or credentials, so it is logged, never returned.
+func TestGatedHandleReturnsASafeEnvelope(t *testing.T) {
 	h := &handler{
 		d:      modulesdk.Descriptor{Token: "testmod"},
 		health: newHealthGate(nil, "testmod"),
 	}
-	h.health.forceUnready("acme_iam_ext returned 500 for /_enrich_identity")
+	h.health.forceUnready("acme_iam_ext at grpc://10.0.0.7:9000 returned 500 for /_enrich_identity token=abc123")
 
 	resp, err := h.Handle(context.Background(), &modulerpc.HandleRequest{Method: "GET", Path: "/anything"})
 	if err != nil {
@@ -105,8 +105,17 @@ func TestGatedHandleReportsTheReason(t *testing.T) {
 	if resp.GetStatus() != 503 {
 		t.Fatalf("status = %d, want 503", resp.GetStatus())
 	}
-	if body := string(resp.GetBody()); !strings.Contains(body, "acme_iam_ext returned 500") {
-		t.Errorf("the 503 body hides the reason: %s", body)
+	envelope, err := modulesdk.DecodeErrorEnvelope(resp.GetBody())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Code != modulesdk.ErrorCodeVerificationPending {
+		t.Errorf("code = %q, want %q", envelope.Code, modulesdk.ErrorCodeVerificationPending)
+	}
+	for _, secret := range []string{"acme_iam_ext", "10.0.0.7", "abc123", "_enrich_identity"} {
+		if strings.Contains(string(resp.GetBody()), secret) {
+			t.Errorf("the public body leaks %q: %s", secret, resp.GetBody())
+		}
 	}
 }
 

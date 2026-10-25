@@ -1,0 +1,35 @@
+// The serialisable UI declarations a module reports through Describe (UX A6, A10, A11;
+// sdk.md S2). Imported by modulerpc.proto; it defines no service.
+syntax = "proto3";
+package mycel.modulerpc.v1;
+
+option go_package = "github.com/mycelpf/mycel_module_sdk/contracts/modulerpc/v1;modulerpc";
+
+// The module's UI kind (UX "UI kind and runtime-mode matrix").
+enum UIKind {
+  UI_KIND_UNSPECIFIED = 0;
+  UI_KIND_SHELL       = 1;  // mounted as <token>-app inside the host shell
+  UI_KIND_OWN         = 2;  // the module owns / and every non-reserved page
+}
+
+// One optional shell slot provider (UX A6): {id, schemaMajor, title, providerPath}.
+message SlotDescriptor {
+  string id            = 1;  // chat or jobs
+  uint32 schema_major  = 2;  // 1
+  string title         = 3;  // localisation key
+  string provider_path = 4;  // same-origin path under the module's api_prefix
+}
+
+// Describe.ui (UX A10): {elementName, entryAsset, contractMajor, minContractMinor,
+// browserRoutes, apiPrefix, assetPrefix}, plus the UI kind and optional slots.
+message UIDescriptor {
+  UIKind kind                   = 1;
+  string element_name           = 2;  // <token>-app
+  string entry_asset            = 3;  // same-origin path under asset_prefix
+  uint32 contract_major         = 4;
+  uint32 min_contract_minor     = 5;
+  repeated string browser_routes = 6; // patterns relative to /m/<token>
+  string api_prefix             = 7;  // /m/<token>/...
+  string asset_prefix           = 8;  // /m/<token>/...
+  repeated SlotDescriptor slots = 9;
+}

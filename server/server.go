@@ -23,35 +23,34 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
-	"math/rand"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/signal"
-	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/mycelpf/mycel_module_sdk"
 	modulerpc "github.com/mycelpf/mycel_module_sdk/contracts/modulerpc/v1"
+	"github.com/mycelpf/mycel_module_sdk/wire"
 
 	_ "github.com/lib/pq"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
-	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
 )
@@ -72,167 +71,6 @@ const shutdownGrace = 15 * time.Second
 // healthPingTTL debounces the readiness DB ping: Health reuses the last ping result
 // for this long instead of hammering the datastore on every probe.
 const healthPingTTL = 2 * time.Second
-
-// Serve launches the module's gRPC server from a Descriptor and blocks until it
-// exits. It reads MYCEL_LISTEN (the backend the host dials; default a per-token unix
-// socket) and DATABASE_URL (the module's own datastore; absent → DB routes error).
-//
-// On SIGTERM/SIGINT it stops accepting, drains in-flight RPCs (GracefulStop, with a
-// hard Stop after shutdownGrace), closes the DB, and removes the unix socket file.
-func Serve(d modulesdk.Descriptor) {
-	addr := envOr("MYCEL_LISTEN", "unix://"+filepath.Join(defaultSocketDir, d.Token+".sock"))
-	network, address := "tcp", addr
-	if s, ok := strings.CutPrefix(addr, "unix://"); ok {
-		network, address = "unix", s
-		// Validate the UDS path length BEFORE listening: the kernel's sockaddr_un.sun_path
-		// is fixed-size (104 on darwin, 108 on linux), and an over-long path is silently
-		// truncated, so fail loudly with the actual limit instead of dialing a wrong socket.
-		if err := validateUDSPath(address); err != nil {
-			log.Fatalf("%s: %v", d.Token, err)
-		}
-		// 0700: only this uid may enter the dir (defence in depth alongside peer-uid auth).
-		_ = os.MkdirAll(filepath.Dir(address), 0o700)
-		_ = os.Remove(address) // clear a stale socket from a prior run
-	}
-	lis, err := net.Listen(network, address)
-	if err != nil {
-		log.Fatalf("%s: listen %s: %v", d.Token, addr, err)
-	}
-	// On a unix socket, gate accepted connections on the peer's uid (best effort).
-	if network == "unix" {
-		lis = &peerAuthListener{Listener: lis, token: d.Token, wantUID: os.Getuid()}
-	}
-
-	var db *sql.DB
-	if dsn := os.Getenv("DATABASE_URL"); dsn != "" {
-		if db, err = sql.Open("postgres", dsn); err != nil {
-			log.Fatalf("%s: open db: %v", d.Token, err)
-		}
-		// Bound the pool: sql.Open defaults to UNLIMITED open conns, so a request
-		// spike from one module can exhaust Postgres max_connections for the whole
-		// federation. Idle conns stay warm; a max lifetime recycles conns through
-		// poolers/failovers.
-		db.SetMaxOpenConns(intEnv("MYCEL_DB_MAX_OPEN", 16))
-		db.SetMaxIdleConns(intEnv("MYCEL_DB_MAX_IDLE", 4))
-		db.SetConnMaxLifetime(30 * time.Minute)
-		if err := applyMigrations(db, d); err != nil {
-			log.Fatalf("%s: migrate: %v", d.Token, err)
-		}
-	} else {
-		log.Printf("%s: DATABASE_URL unset — DB-backed routes will error", d.Token)
-	}
-
-	// OpenTelemetry OTLP trace export — no-op unless OTEL_EXPORTER_OTLP_ENDPOINT is set.
-	// Installs the TracerProvider + W3C propagator the otelgrpc stats handler below needs.
-	telCtx := context.Background()
-	shutdownTel, err := initTelemetry(telCtx, envOr("OTEL_SERVICE_NAME", d.Token))
-	if err != nil {
-		log.Printf("%s: telemetry init: %v (continuing without traces)", d.Token, err)
-	}
-	// Flushed in cleanup(), not deferred: the serve-error branch exits via os.Exit, which
-	// skips defers — and dropping the last batch of spans is exactly what you need when
-	// diagnosing why serve failed.
-
-	srv := grpc.NewServer(
-		grpc.MaxRecvMsgSize(maxMsgBytes),
-		grpc.MaxSendMsgSize(maxMsgBytes),
-		grpc.ChainUnaryInterceptor(recoverUnary(d.Token)),
-		grpc.StatsHandler(otelgrpc.NewServerHandler()),
-		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
-			MinTime:             5 * time.Second, // reject clients pinging faster than this
-			PermitWithoutStream: true,            // the host keepalives idle conns (no active RPC)
-		}),
-		grpc.KeepaliveParams(keepalive.ServerParameters{
-			MaxConnectionIdle: 0,                // host conns are long-lived; don't recycle on idle
-			Time:              30 * time.Second, // ping an idle conn to detect a dead host
-			Timeout:           10 * time.Second, // ...and drop it if the ping isn't answered
-		}),
-	)
-	hg := newHealthGate(db, d.Token)
-	// Deploy-time conformance gate: hold the module NOT_SERVING until Descriptor.Verify
-	// passes, so a configured-but-non-conformant collaborator (e.g. a client extension
-	// that doesn't honor the contract) makes the whole app unready — fail-closed and
-	// loud — instead of silently degrading. Runs in the background so the gRPC server
-	// (incl. Health) is already up for k8s readiness probes to observe NOT_SERVING.
-	if d.Verify != nil {
-		hg.forceUnready("startup verification pending")
-		go runVerifyGate(d, hg)
-	}
-	modulerpc.RegisterModuleHandlerServer(srv, &handler{d: d, db: db, health: hg})
-	// The standard health service too, so k8s can probe this module natively — see
-	// health_grpc.go. Same gate, so the two answers can never disagree.
-	healthpb.RegisterHealthServer(srv, &grpcHealth{gate: hg})
-	log.Printf("%s module serving gRPC on %s://%s", d.Token, network, address)
-
-	// Graceful shutdown: trap signals, drain, then clean up the DB + socket.
-	errCh := make(chan error, 1)
-	go func() { errCh <- srv.Serve(lis) }()
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
-
-	select {
-	case err := <-errCh:
-		if err != nil {
-			// NOT log.Fatalf: os.Exit would skip the module's Shutdown hook (losing
-			// whatever it had queued) and the telemetry flush. Clean up, then exit 1.
-			log.Printf("%s: serve: %v", d.Token, err)
-			cleanup(d, db, network, address, shutdownTel)
-			os.Exit(1)
-		}
-	case sig := <-sigCh:
-		log.Printf("%s: %v received, draining…", d.Token, sig)
-		done := make(chan struct{})
-		go func() { srv.GracefulStop(); close(done) }()
-		select {
-		case <-done:
-		case <-time.After(shutdownGrace):
-			log.Printf("%s: graceful shutdown timed out after %s, forcing stop", d.Token, shutdownGrace)
-			srv.Stop()
-		}
-	}
-
-	cleanup(d, db, network, address, shutdownTel)
-}
-
-// cleanup is the ONE shutdown path, run from both the signal branch and the serve-error
-// branch. The order is load-bearing:
-//
-//	GracefulStop (already done by the caller) → Descriptor.Shutdown → db.Close → socket
-//
-// Shutdown runs only once the gRPC server has stopped accepting, so a handler cannot
-// enqueue into a queue that is already draining; and before db.Close, so the hook may
-// still write (e.g. flushing to its own datastore).
-func cleanup(d modulesdk.Descriptor, db *sql.DB, network, address string, flushTel telemetryShutdown) {
-	if d.Shutdown != nil {
-		to := time.Duration(intEnv("MYCEL_SHUTDOWN_TIMEOUT_MS", 8000)) * time.Millisecond
-		// context.Background(), not any inherited ctx: the signal has already fired, so
-		// every request-scoped context is cancelled and the hook would get no time at all.
-		sctx, cancel := context.WithTimeout(context.Background(), to)
-		if err := d.Shutdown(sctx); err != nil {
-			// Not fatal — the process is exiting regardless. The error exists to leave a
-			// trace of what could NOT be delivered, which is the whole point of the hook.
-			log.Printf("%s: shutdown hook: %v", d.Token, err)
-		}
-		cancel()
-	}
-	// After the hook, which may itself have used CallExt to drain (the analytics client
-	// does exactly that), and before the process goes: nothing had ever closed these, so
-	// they were left to process exit.
-	closeExtConns()
-	if db != nil {
-		_ = db.Close()
-	}
-	if network == "unix" {
-		_ = os.Remove(address)
-	}
-	if flushTel != nil {
-		tctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = flushTel(tctx)
-		cancel()
-	}
-	log.Printf("%s: stopped", d.Token)
-}
 
 // validateUDSPath fails when a unix-socket path would overflow the kernel's fixed
 // sockaddr_un.sun_path (which silently truncates), so a too-long MYCEL_LISTEN is a
@@ -323,7 +161,7 @@ func recoverUnary(token string) grpc.UnaryServerInterceptor {
 			// module is up; one route misbehaved, and that distinction is the whole
 			// difference between "redeploy" and "look at this handler".
 			if info.FullMethod == handleFullMethod {
-				resp, err = errResponse(500, "internal error"), nil
+				resp, err = errResponse(500, modulesdk.ErrorCodeInternal, "internal error", traceIDFromContext(ctx)), nil
 				return
 			}
 			resp, err = nil, status.Errorf(codes.Internal, "panic in %s", info.FullMethod)
@@ -341,21 +179,17 @@ type handler struct {
 	d      modulesdk.Descriptor
 	db     *sql.DB
 	health *healthGate
+	// describe is built and validated once at boot; nil builds it per call (tests).
+	describe *modulerpc.DescribeResponse
 }
 
+// Describe answers from the descriptor, including while startup verification is pending
+// (sdk.md S3): the supervisor and app_core read metadata without calling a gated route.
 func (h *handler) Describe(context.Context, *modulerpc.DescribeRequest) (*modulerpc.DescribeResponse, error) {
-	nav := make([]*modulerpc.NavEntry, len(h.d.Nav))
-	for i, n := range h.d.Nav {
-		nav[i] = &modulerpc.NavEntry{Label: n.Label, Path: n.Path}
+	if h.describe != nil {
+		return h.describe, nil
 	}
-	return &modulerpc.DescribeResponse{
-		Token:           h.d.Token,
-		ContractVersion: h.d.ContractVersion,
-		MenuGroup:       h.d.MenuGroup,
-		Nav:             nav,
-		UiEntry:         h.d.UIEntry,
-		Openapi:         h.d.OpenAPI,
-	}, nil
+	return wire.DescribeResponseFromDiscovery(h.d.Discovery()), nil
 }
 
 // Health reports readiness: SERVING when the module has no DB, or a recent debounced
@@ -374,91 +208,190 @@ func (h *handler) Handle(ctx context.Context, req *modulerpc.HandleRequest) (*mo
 	// honor the contract), the module refuses ALL traffic — not just signalling
 	// NOT_SERVING on Health, but actually not serving its routes — so a non-conformant
 	// collaborator makes the module unusable until it's fixed. Cleared gate ⇒ no cost.
-	if r := h.health.gate.Load(); r != nil {
-		// Carry the reason rather than pointing at the logs: the caller is often another
-		// module or the console, neither of which can read this process's stderr, and the
-		// gate is still retrying — so this is a "not yet", not a verdict.
-		return errResponse(503, "module not serving: startup verification failing — "+*r), nil
+	if h.health.gate.Load() != nil {
+		// A stable code and a fixed, safe message (sdk.md S8). The verification report can
+		// name collaborators, addresses or credentials, so it stays in this process's log
+		// (redacted) and never reaches a public caller; app_core decides what to show.
+		return errResponse(503, modulesdk.ErrorCodeVerificationPending,
+			"module not ready: startup verification has not passed", traceIDFromContext(ctx)), nil
 	}
 
-	// http.Handler modules: bridge the gRPC request to ServeHTTP. The handler owns its
-	// own datastore, so the SDK applies no tx/search_path here (it still ran the
-	// module's migrations at boot).
-	if h.d.Handler != nil {
-		return bridgeHTTP(ctx, h.d.Handler, req), nil
+	// Budgets and header validity are checked before the module runs (sdk.md S4, S5).
+	if err := wire.CheckHandleRequestBudget(req); err != nil {
+		log.Printf("%s: request refused: %v", h.d.Token, err)
+		return errResponse(413, modulesdk.ErrorCodeRequestTooLarge, "the request is too large", traceIDFromContext(ctx)), nil
+	}
+	fields, err := wire.HeaderFieldsFromHandleRequest(req)
+	if err != nil {
+		log.Printf("%s: request refused: %v", h.d.Token, err)
+		return errResponse(400, modulesdk.ErrorCodeInvalidHeader, "a request header is invalid", traceIDFromContext(ctx)), nil
 	}
 
-	lr := modulesdk.Request{
-		Method:  req.GetMethod(),
-		Path:    req.GetPath(),
-		Query:   req.GetQuery(),
-		Headers: req.GetHeaders(),
-		Body:    req.GetBody(),
-	}
-
-	// Reserved SDK route, namespaced so it can never collide with a module author's
-	// own paths: process + DB vitals for the host's /api/system probe
-	// (DESIGN_console_performance §2). Intercepted here, before any tx/host setup —
-	// module authors never see this route, and it never opens a transaction.
-	if lr.Path == "/_mycel/vitals" {
+	// SDK-owned diagnostics precede both handler styles and never open a transaction.
+	if req.GetPath() == "/_mycel/vitals" {
 		return vitalsResponse(ctx, h), nil
 	}
+	// HTTP handlers own their datastore; do not apply SDK transactions here.
+	if h.d.Handler != nil {
+		return h.checkResponse(ctx, req, bridgeHTTP(modulesdk.ContextWithUser(ctx, wire.UserFromUserContext(req.GetUser())), h.d.Handler, req), nil), nil
+	}
+
+	// The legacy map is what the host sent, or the compatibility view of the header
+	// fields when the host sent those (sdk.md S4).
+	legacy := req.GetHeaders()
+	if len(req.GetHeaderFields()) > 0 {
+		legacy = modulesdk.LegacyHeaderMap(fields)
+	}
+	lr := modulesdk.Request{
+		Method:       req.GetMethod(),
+		Path:         req.GetPath(),
+		Query:        req.GetQuery(),
+		Headers:      legacy,
+		HeaderFields: fields,
+		Body:         req.GetBody(),
+		// Only from the wire field app_core sets after verifying a credential; never from
+		// a header (sdk.md S11.4).
+		User: wire.UserFromUserContext(req.GetUser()),
+	}.WithContext(ctx)
 
 	// Propagate the active trace context into the request headers (traceparent/
-	// tracestate) so module logic — deliberately ctx-free — can forward it on
-	// outbound HTTP calls (e.g. a Temporal worker service) and keep the distributed
-	// trace stitched across that hop. No-op when tracing is off (no propagator).
-	if lr.Headers == nil {
-		lr.Headers = map[string]string{}
+	// tracestate) so module logic can forward it on outbound HTTP calls (e.g. a Temporal
+	// worker service) and keep the distributed trace stitched across that hop. No-op
+	// when tracing is off (no propagator).
+	carrier := propagation.MapCarrier{}
+	otel.GetTextMapPropagator().Inject(ctx, carrier)
+	if lr.Headers == nil || len(carrier) > 0 {
+		copied := make(map[string]string, len(lr.Headers)+len(carrier))
+		for name, value := range lr.Headers {
+			copied[name] = value
+		}
+		lr.Headers = copied
 	}
-	otel.GetTextMapPropagator().Inject(ctx, propagation.MapCarrier(lr.Headers))
+	for name, value := range carrier {
+		lr.Headers[name] = value
+		lr.HeaderFields = setHeaderField(lr.HeaderFields, name, value)
+	}
 
 	// No DB wired → a stub host whose data calls error (static routes still serve).
-	var host modulesdk.Host = noDBHost{}
-	var tx *sql.Tx
+	var host modulesdk.Host = noDBHost{ctx: ctx}
+	var lazy *lazyTxHost
 	if h.db != nil {
-		// BeginTx carries the inbound request context, so a host deadline/cancel aborts
-		// the transaction (and the statements below) instead of running detached.
-		t, err := h.db.BeginTx(ctx, nil)
-		if err != nil {
-			return errResponse(500, "db begin"), nil
-		}
+		lazy = &lazyTxHost{txHost: txHost{ctx: ctx}, db: h.db, token: h.d.Token}
 		// Backstop for the panic path: recoverUnary turns a panic in Route into a 500,
-		// but the transaction below is already open at that point and nothing else would
-		// ever release its pool connection. Rollback after a Commit is ErrTxDone — a
+		// but a transaction the route opened is still open at that point and nothing else
+		// would ever release its pool connection. Rollback after a Commit is ErrTxDone — a
 		// no-op — so this is safe on every path, not just the panicking one.
-		defer t.Rollback()
-		if _, err := t.ExecContext(ctx, "SET LOCAL search_path TO "+h.d.Token); err != nil { // token validated
-			return errResponse(500, "search_path"), nil
-		}
-		tx, host = t, &txHost{ctx: ctx, tx: t}
+		defer lazy.rollback()
+		host = lazy
 	}
 
 	resp := h.d.Route(lr, host)
+	encoded, encodeErr := encodeRouteResponse(resp)
+	if encodeErr == nil {
+		encodeErr = wire.CheckHandleResponseBudget(encoded)
+	}
 
-	if tx != nil {
-		if resp.Status < 500 {
+	if tx := lazy.opened(); tx != nil {
+		if encodeErr != nil {
+			// The response cannot be delivered, so the write is not applied: the caller
+			// sees a failure that means "nothing happened" (sdk.md S5). Never retried.
+			_ = tx.Rollback()
+		} else if resp.Status < 500 {
 			// The commit error is the answer, not a detail to drop. A connection that
 			// dies during COMMIT — precisely what a Postgres failover produces — rolls
 			// the transaction back; returning the route's 200 there tells the caller a
 			// write succeeded that does not exist.
 			if err := tx.Commit(); err != nil {
 				log.Printf("%s: commit failed after %d on %s %s: %v", h.d.Token, resp.Status, lr.Method, lr.Path, err)
-				return errResponse(500, "commit failed — the request was not applied"), nil
+				return errResponse(500, modulesdk.ErrorCodeCommitFailed, "commit failed — the request was not applied", traceIDFromContext(ctx)), nil
 			}
 		} else {
 			_ = tx.Rollback() // already failing; the rollback error adds nothing
 		}
 	}
 
-	headers := resp.Headers
-	if headers == nil {
-		headers = map[string]string{}
+	return h.checkResponse(ctx, req, encoded, encodeErr), nil
+}
+
+// checkResponse turns a module response that cannot be sent into a bounded error: an
+// invalid header becomes 500 invalid_header, a response above a budget becomes 502
+// module_response_too_large (sdk.md S4, S5). The detail is logged, never returned.
+func (h *handler) checkResponse(ctx context.Context, req *modulerpc.HandleRequest, response *modulerpc.HandleResponse, err error) *modulerpc.HandleResponse {
+	if err == nil {
+		_, err = wire.HeaderFieldsFromHandleResponse(response)
 	}
-	if headers["content-type"] == "" {
-		headers["content-type"] = "application/json"
+	if err == nil {
+		err = wire.CheckHandleResponseBudget(response)
 	}
-	return &modulerpc.HandleResponse{Status: uint32(resp.Status), Headers: headers, Body: []byte(resp.Body)}, nil
+	if err == nil {
+		return response
+	}
+	log.Printf("%s: response to %s %s refused: %v", h.d.Token, req.GetMethod(), req.GetPath(), err)
+	if errors.Is(err, modulesdk.ErrInvalidHeader) {
+		return errResponse(500, modulesdk.ErrorCodeInvalidHeader, "the module sent an invalid response header", traceIDFromContext(ctx))
+	}
+	return errResponse(502, modulesdk.ErrorCodeModuleResponseTooLarge, "the module response is too large", traceIDFromContext(ctx))
+}
+
+// encodeRouteResponse maps a Route response to the wire (sdk.md S4). HeaderFields is
+// authoritative when set; otherwise the legacy map is read through the compatibility
+// adapter, and sent unchanged as the legacy map for hosts that predate header fields.
+// content-type defaults to application/json, except on 204 and 304 and when the module
+// set one. The body is sent byte for byte.
+func encodeRouteResponse(resp modulesdk.Response) (*modulerpc.HandleResponse, error) {
+	source := resp.HeaderFields
+	if len(source) == 0 {
+		source = modulesdk.HeaderFieldsFromLegacyMap(resp.Headers)
+	}
+	fields, err := modulesdk.NormalizeHeaderFields(source)
+	if err != nil {
+		return nil, err
+	}
+	var legacy map[string]string
+	if len(resp.HeaderFields) == 0 {
+		legacy = make(map[string]string, len(resp.Headers)+1)
+		for name, value := range resp.Headers {
+			legacy[name] = value
+		}
+	} else {
+		legacy = modulesdk.LegacyHeaderMap(fields)
+	}
+	hasContentType := false
+	for _, field := range fields {
+		if field.Name == "content-type" && len(field.Values) > 0 && field.Values[0] != "" {
+			hasContentType = true
+		}
+	}
+	if !hasContentType && resp.Status != 204 && resp.Status != 304 {
+		for name := range legacy {
+			if strings.EqualFold(name, "content-type") {
+				delete(legacy, name)
+			}
+		}
+		fields = setHeaderField(fields, "content-type", "application/json")
+		if legacy == nil {
+			legacy = map[string]string{}
+		}
+		legacy["content-type"] = "application/json"
+	}
+	return &modulerpc.HandleResponse{
+		Status:       uint32(resp.Status),
+		Headers:      legacy,
+		HeaderFields: wire.HeaderFieldsToWire(fields),
+		Body:         []byte(resp.Body),
+	}, nil
+}
+
+// setHeaderField returns fields with name set to the single value, replacing any values
+// it had. fields is not modified.
+func setHeaderField(fields []modulesdk.HeaderField, name, value string) []modulesdk.HeaderField {
+	updated := make([]modulesdk.HeaderField, 0, len(fields)+1)
+	for _, field := range fields {
+		if field.Name != name {
+			updated = append(updated, field)
+		}
+	}
+	return append(updated, modulesdk.HeaderField{Name: name, Values: []string{value}})
 }
 
 // vitalsResponse answers the reserved /_mycel/vitals route: process runtime stats
@@ -498,22 +431,29 @@ func vitalsResponse(ctx context.Context, h *handler) *modulerpc.HandleResponse {
 	}
 	b, err := json.Marshal(body)
 	if err != nil {
-		return errResponse(500, "vitals marshal")
+		return errResponse(500, modulesdk.ErrorCodeInternal, "vitals marshal", traceIDFromContext(ctx))
 	}
 	return &modulerpc.HandleResponse{Status: 200, Headers: map[string]string{"content-type": "application/json"}, Body: b}
 }
 
-func errResponse(status uint32, msg string) *modulerpc.HandleResponse {
-	// json.Marshal (not string concatenation) so a message containing a quote or
-	// backslash — e.g. a pq error naming a "quoted" identifier — still yields VALID
-	// JSON instead of a body the client can't parse. Marshal of a map[string]string
-	// cannot fail, so the error is safe to drop.
-	body, _ := json.Marshal(map[string]string{"error": msg})
+// errResponse answers with the shared error envelope (sdk.md S8). json.Marshal (not
+// string concatenation) keeps the body valid JSON whatever the message holds.
+func errResponse(status uint32, code, message, traceID string) *modulerpc.HandleResponse {
+	body, _ := json.Marshal(modulesdk.ErrorEnvelope{Code: code, Message: message, TraceID: traceID})
 	return &modulerpc.HandleResponse{
 		Status:  status,
 		Headers: map[string]string{"content-type": "application/json"},
 		Body:    body,
 	}
+}
+
+// traceIDFromContext is the active trace ID, or "" when tracing is off.
+func traceIDFromContext(ctx context.Context) string {
+	spanContext := trace.SpanContextFromContext(ctx)
+	if !spanContext.HasTraceID() {
+		return ""
+	}
+	return spanContext.TraceID().String()
 }
 
 // healthGate debounces the readiness DB ping behind a short TTL cache so Health
@@ -540,73 +480,6 @@ type healthGate struct {
 // forceUnready pins the gate to NOT_SERVING with a human-readable reason; ready() clears it.
 func (g *healthGate) forceUnready(reason string) { g.gate.Store(&reason) }
 func (g *healthGate) ready()                     { g.gate.Store(nil) }
-
-// Verify-gate retry shape. The gate is fail-closed but NOT one-shot: it keeps probing
-// until it passes, so a collaborator that is fixed or finishes booting brings this module
-// back on its own.
-// vars, not consts, so tests can shrink the sleeps and exercise the control flow without
-// the clock (same reason the CLI's load simulator keeps its backoff knobs assignable).
-var (
-	verifyBackoffBase = 2 * time.Second
-	verifyBackoffMax  = 30 * time.Second
-	verifyLoudAfter   = 12              // ~22s of quiet grace before the banner
-	verifyRemindEvery = 5 * time.Minute // then a reminder at this cadence, not per attempt
-)
-
-// runVerifyGate runs the module's Verify until it passes, holding the module NOT_SERVING
-// meanwhile. It never gives up.
-//
-// It used to stop after 12 attempts (~22s) and pin the gate forever. Nothing cleared that
-// pin — there was no re-verify and no path back to ready() — so the module answered 503 on
-// EVERY route until a human redeployed it, and module pods carry no livenessProbe, so
-// nothing restarted them either. A collaborator that took 23 seconds to boot bricked its
-// base module. Since the failure modes that gate legitimately catches — a dependency still
-// booting, a dependency down, a dependency deployed non-conformant and then fixed — are
-// all repairable WITHOUT touching this module, giving up was never the right answer to any
-// of them; retrying is correct for all three and needs no way to tell them apart.
-//
-// Fail-closed is preserved: the module stays out of rotation the entire time it is failing.
-func runVerifyGate(d modulesdk.Descriptor, hg *healthGate) {
-	var host modulesdk.Host = noDBHost{}
-	delay := verifyBackoffBase
-	failed := false
-	lastLoud := time.Time{}
-
-	for attempt := 1; ; attempt++ {
-		err := d.Verify(host)
-		if err == nil {
-			hg.ready()
-			if failed {
-				log.Printf("%s: startup verification passed after %d attempts — module READY (recovered without a redeploy)", d.Token, attempt)
-			} else {
-				log.Printf("%s: startup verification passed — module READY", d.Token)
-			}
-			return
-		}
-
-		hg.forceUnready(err.Error())
-
-		// Loud once when it stops looking like ordinary boot lag, then only at a slow
-		// cadence: this loop runs forever, and a banner per attempt would bury the logs
-		// an operator needs to diagnose the collaborator.
-		if attempt == verifyLoudAfter || (failed && time.Since(lastLoud) >= verifyRemindEvery) {
-			bar := strings.Repeat("=", 72)
-			log.Printf("\n%s\n%s: STARTUP VERIFICATION FAILING — holding NOT_SERVING (fail-closed), still retrying\n%s\n%s",
-				bar, d.Token, err.Error(), bar)
-			lastLoud = time.Now()
-			failed = true
-		}
-
-		// Full jitter on a capped exponential, matching the analytics flusher: without it
-		// every module in the fleet re-probes a struggling collaborator in lockstep.
-		time.Sleep(time.Duration(rand.Int63n(int64(delay) + 1)))
-		if delay < verifyBackoffMax {
-			if delay *= 2; delay > verifyBackoffMax {
-				delay = verifyBackoffMax
-			}
-		}
-	}
-}
 
 func newHealthGate(db *sql.DB, token string) *healthGate { return &healthGate{db: db, token: token} }
 
@@ -657,6 +530,76 @@ func (g *healthGate) check(ctx context.Context) (ok bool, pingMs float64) {
 type txHost struct {
 	ctx context.Context
 	tx  *sql.Tx
+}
+
+// lazyTxHost is the per-request Host: it opens the request's transaction on the route's
+// FIRST Query or Exec, not before Route runs. A route that never touches the datastore —
+// /openapi.json, /info, /health, one that only calls other services — then costs no
+// BEGIN/SET LOCAL/COMMIT round trips and holds no pooled connection.
+//
+// BeginTx carries the inbound request context, so a host deadline/cancel aborts the
+// transaction (and its statements) instead of running detached. A failure to open is
+// returned to the route as the error of the call that needed it, and is sticky for the
+// request, so a route never runs half its statements outside the transaction.
+type lazyTxHost struct {
+	txHost
+	db    *sql.DB
+	token string
+	mu    sync.Mutex
+	err   error
+}
+
+func (h *lazyTxHost) open() (*txHost, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.tx != nil || h.err != nil {
+		return &h.txHost, h.err
+	}
+	t, err := h.db.BeginTx(h.ctx, nil)
+	if err != nil {
+		h.err = fmt.Errorf("db begin: %w", err)
+		return nil, h.err
+	}
+	if _, err := t.ExecContext(h.ctx, "SET LOCAL search_path TO "+h.token); err != nil { // token validated
+		_ = t.Rollback()
+		h.err = fmt.Errorf("search_path: %w", err)
+		return nil, h.err
+	}
+	h.tx = t
+	return &h.txHost, nil
+}
+
+func (h *lazyTxHost) Query(q string, params []string) ([]modulesdk.Row, error) {
+	t, err := h.open()
+	if err != nil {
+		return nil, err
+	}
+	return t.Query(q, params)
+}
+
+func (h *lazyTxHost) Exec(q string, params []string) (uint64, error) {
+	t, err := h.open()
+	if err != nil {
+		return 0, err
+	}
+	return t.Exec(q, params)
+}
+
+// opened is the transaction the route caused, or nil if it never touched the datastore.
+// Nil-safe so the no-DB path needs no branch.
+func (h *lazyTxHost) opened() *sql.Tx {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.tx
+}
+
+func (h *lazyTxHost) rollback() {
+	if tx := h.opened(); tx != nil {
+		_ = tx.Rollback()
+	}
 }
 
 func (h *txHost) Query(q string, params []string) ([]modulesdk.Row, error) {
@@ -738,10 +681,8 @@ var extCallTimeout = envDuration("MYCEL_EXT_TIMEOUT_MS", 3*time.Second)
 //   - ConnectParams: grpc-go's default reconnect backoff climbs to 120 SECONDS and
 //     nothing resets it, so an extension that came back stayed unreachable for minutes.
 //
-// The retry policy covers UNAVAILABLE only. That code means the RPC did not reach a
-// server — no ready subchannel, connection refused, or the transport went away before
-// the request was sent — so replaying it does not risk double-applying anything. Codes
-// that mean the server DID see it are deliberately excluded.
+// UNAVAILABLE can follow an applied write. Select retries by HTTP method in
+// callExt rather than applying a blanket policy to the Handle RPC.
 func extDialOptions() []grpc.DialOption {
 	return []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
@@ -758,18 +699,7 @@ func extDialOptions() []grpc.DialOption {
 			},
 			MinConnectTimeout: 5 * time.Second,
 		}),
-		grpc.WithDefaultServiceConfig(`{
-  "methodConfig": [{
-    "name": [{"service": "mycel.modulerpc.v1.ModuleHandler", "method": "Handle"}],
-    "retryPolicy": {
-      "maxAttempts": 3,
-      "initialBackoff": "0.1s",
-      "maxBackoff": "1s",
-      "backoffMultiplier": 2.0,
-      "retryableStatusCodes": ["UNAVAILABLE"]
-    }
-  }]
-}`),
+		grpc.WithDisableRetry(),
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(maxMsgBytes),
 			grpc.MaxCallSendMsgSize(maxMsgBytes),
@@ -798,7 +728,25 @@ func callExt(parent context.Context, envKey, method, path string, body []byte) (
 	}
 	ctx, cancel := context.WithTimeout(parent, extCallTimeout)
 	defer cancel()
-	resp, err := cl.Handle(ctx, &modulerpc.HandleRequest{Method: method, Path: path, Body: body})
+	req := &modulerpc.HandleRequest{Method: method, Path: path, Body: body}
+	var resp *modulerpc.HandleResponse
+	for attempt := 0; ; attempt++ {
+		resp, err = cl.Handle(ctx, req)
+		if err == nil || status.Code(err) != codes.Unavailable || attempt >= 2 ||
+			(method != http.MethodGet && method != http.MethodHead && method != http.MethodOptions) {
+			break
+		}
+		timer := time.NewTimer(time.Duration(100*(1<<attempt)) * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+		case <-timer.C:
+		}
+		if ctx.Err() != nil {
+			err = ctx.Err()
+			break
+		}
+	}
 	if err != nil {
 		// Log it: the callers of this are best-effort by design (an unreachable
 		// extension leaves the base identity untouched), so without a line here a
@@ -840,15 +788,19 @@ func closeExtConns() {
 }
 
 // noDBHost is the host when DATABASE_URL is unset: static routes work; data routes
-// get a clear error rather than a nil-pointer panic.
-type noDBHost struct{}
+// get a clear error rather than a nil-pointer panic. CallExt carries the request context.
+type noDBHost struct{ ctx context.Context }
 
 func (noDBHost) Query(string, []string) ([]modulesdk.Row, error) { return nil, errNoDB }
 func (noDBHost) Exec(string, []string) (uint64, error)           { return 0, errNoDB }
 func (noDBHost) Log(level, msg string)                           { log.Printf("[%s] %s", level, msg) }
 func (noDBHost) NowMillis() uint64                               { return uint64(time.Now().UnixMilli()) }
-func (noDBHost) CallExt(envKey, method, path string, body []byte) (uint16, []byte, bool, error) {
-	return callExt(context.Background(), envKey, method, path, body)
+func (h noDBHost) CallExt(envKey, method, path string, body []byte) (uint16, []byte, bool, error) {
+	ctx := h.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return callExt(ctx, envKey, method, path, body)
 }
 
 var errNoDB = errString("DATABASE_URL not set — this module's data routes are unavailable")
@@ -885,17 +837,39 @@ func bridgeHTTP(ctx context.Context, h http.Handler, req *modulerpc.HandleReques
 	}
 
 	hr := httptest.NewRequestWithContext(ctx, method, target, bytes.NewReader(req.GetBody()))
-	for k, v := range req.GetHeaders() {
-		hr.Header.Set(k, v)
+	if fields := req.GetHeaderFields(); len(fields) > 0 {
+		for _, field := range fields {
+			for _, value := range field.GetValues() {
+				hr.Header.Add(field.GetName(), value)
+			}
+		}
+	} else {
+		for k, v := range req.GetHeaders() {
+			hr.Header.Set(k, v)
+		}
 	}
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, hr)
 
-	headers := make(map[string]string, len(rec.Header()))
-	for k := range rec.Header() {
-		headers[k] = rec.Header().Get(k)
+	result := rec.Result()
+	defer result.Body.Close()
+	names := make([]string, 0, len(result.Header))
+	for name := range result.Header {
+		names = append(names, name)
 	}
-	return &modulerpc.HandleResponse{Status: uint32(rec.Code), Headers: headers, Body: rec.Body.Bytes()}
+	sort.Strings(names)
+	headers := make(map[string]string, len(result.Header))
+	fields := make([]*modulerpc.HeaderField, 0, len(names))
+	for _, k := range names {
+		values := result.Header[k]
+		separator := ", "
+		if strings.EqualFold(k, "set-cookie") {
+			separator = "\n"
+		}
+		headers[k] = strings.Join(values, separator)
+		fields = append(fields, &modulerpc.HeaderField{Name: strings.ToLower(k), Values: append([]string(nil), values...)})
+	}
+	return &modulerpc.HandleResponse{Status: uint32(rec.Code), Headers: headers, HeaderFields: fields, Body: rec.Body.Bytes()}
 }
 
 // peerAuthListener wraps a unix-socket listener and rejects connections whose peer

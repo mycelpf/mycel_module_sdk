@@ -22,8 +22,9 @@
 // Counters ride on every batch so mycel_kpi can record them as KPIs — drops therefore
 // show up on the dashboard itself, with no metrics pipeline in the fabric.
 //
-// This package imports only the standard library: the transport arrives as a plain func
-// value (see Transport), so it never pulls in gRPC and every test drives a fake.
+// This package imports only the standard library and the pure SDK root (for the request
+// type): the transport arrives as a plain func value (see Transport), so it never pulls in
+// gRPC and every test drives a fake.
 package analytics
 
 import (
@@ -32,6 +33,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	modulesdk "github.com/mycelpf/mycel_module_sdk"
 )
 
 // Event is one business fact: true at a moment, immutable forever, past tense, in domain
@@ -41,8 +44,8 @@ type Event struct {
 	Type        string // "OrderSubmitted" — past tense. Required.
 	SubjectType string // "order" — what the event is ABOUT. Required.
 	SubjectID   string // Required: an event with no subject cannot join a paired metric.
-	ActorID     string // Who caused it. Set via WithHeaders.
-	TraceID     string // W3C trace id, for click-through to Tempo. Set via WithHeaders.
+	ActorID     string // Who caused it. Set via WithRequest.
+	TraceID     string // W3C trace id, for click-through to Tempo. Set via WithRequest or WithHeaders.
 
 	// OccurredAt is when the fact became true. Zero → filled by Emit, NOT by the flusher:
 	// a flusher-set timestamp is up to one flush interval late, which would make the
@@ -58,10 +61,25 @@ type Event struct {
 	Nums  map[string]float64 // measures you would SUM
 }
 
-// WithHeaders fills ActorID and TraceID from one inbound request's headers, which is the
-// only place they exist: the flusher runs on a background goroutine with no request and
-// no span, so it cannot derive either. ActorID comes from x-mycel-user (the host injects
-// it after verifying the JWT locally); TraceID from the W3C traceparent the SDK injects.
+// WithRequest fills ActorID and TraceID from one inbound request, which is the only place
+// they exist: the flusher runs on a background goroutine with no request and no span.
+// ActorID comes from the verified user app_core attached to the request (Request.User,
+// sdk.md S11.4): its sub, or its email when it has no sub. A request without a verified
+// user has no actor; the x-mycel-user header is never read. TraceID comes from the W3C
+// traceparent the SDK injects. Values already set are kept.
+func (e Event) WithRequest(request modulesdk.Request) Event {
+	if e.ActorID == "" {
+		e.ActorID = request.User.Sub
+		if e.ActorID == "" {
+			e.ActorID = request.User.Email
+		}
+	}
+	return e.WithHeaders(request.Headers)
+}
+
+// WithHeaders fills TraceID from one inbound request's headers. It no longer sets
+// ActorID: the actor comes only from the verified user (WithRequest), never from a
+// caller-supplied header such as x-mycel-user (sdk.md S11.4).
 //
 // Header names are lower-cased by the SDK. A malformed or all-zero traceparent yields an
 // empty TraceID rather than a bogus one — a wrong trace id is worse than none, because it
@@ -70,36 +88,10 @@ func (e Event) WithHeaders(h map[string]string) Event {
 	if h == nil {
 		return e
 	}
-	if e.ActorID == "" {
-		e.ActorID = actorFrom(h["x-mycel-user"])
-	}
 	if e.TraceID == "" {
 		e.TraceID = traceIDFrom(h["traceparent"])
 	}
 	return e
-}
-
-// actorFrom pulls the subject out of the x-mycel-user JSON without unmarshalling into a
-// type this package would then have to keep in step with the host's User shape. The
-// header is host-generated, so a miss means "no actor", never an error.
-func actorFrom(v string) string {
-	if v == "" {
-		return ""
-	}
-	for _, key := range []string{`"sub"`, `"subject"`, `"id"`, `"email"`} {
-		i := strings.Index(v, key+":")
-		if i < 0 {
-			continue
-		}
-		rest := strings.TrimLeft(v[i+len(key)+1:], " ")
-		if len(rest) == 0 || rest[0] != '"' {
-			continue
-		}
-		if j := strings.IndexByte(rest[1:], '"'); j >= 0 {
-			return rest[1 : 1+j]
-		}
-	}
-	return ""
 }
 
 // traceIDFrom parses the trace-id field of a W3C traceparent

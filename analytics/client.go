@@ -80,13 +80,14 @@ type Client struct {
 	closed  atomic.Bool   // Emit is a no-op once set
 	drainCx atomic.Value  // context.Context, published before close(stop)
 
-	dropping atomic.Bool
-	emitted  atomic.Uint64
-	dropped  atomic.Uint64
-	rejected atomic.Uint64
-	sent     atomic.Uint64
-	retries  atomic.Uint64
-	inFlight atomic.Int64
+	dropping  atomic.Bool
+	emitted   atomic.Uint64
+	dropped   atomic.Uint64
+	rejected  atomic.Uint64
+	discarded atomic.Uint64 // batches discarded because their configured target vanished
+	sent      atomic.Uint64
+	retries   atomic.Uint64
+	inFlight  atomic.Int64
 
 	// read side
 	readTO   time.Duration
@@ -190,13 +191,22 @@ func (c *Client) Shutdown(ctx context.Context) error {
 		ctx, cancel = context.WithTimeout(ctx, defaultDrainCap)
 		defer cancel()
 	}
+	// Existing queue-overflow drops predate this drain. Everything else accepted by
+	// Emit must either be sent/rejected during shutdown or appear in the deadline error.
+	droppedAtStart := c.dropped.Load()
 	c.drainCx.Store(ctx)
 	close(c.stop)
 	select {
 	case <-c.stopped:
 		return nil
 	case <-ctx.Done():
-		n := len(c.q) + int(c.inFlight.Load())
+		n := c.emitted.Load() - droppedAtStart
+		accounted := c.sent.Load() + c.rejected.Load() + c.discarded.Load()
+		if accounted < n {
+			n -= accounted
+		} else {
+			n = 0
+		}
 		// The count IS the deliverable here: it is the only record that these events
 		// existed, since the process is about to exit.
 		return fmt.Errorf("analytics: drain deadline expired with %d event(s) undelivered", n)

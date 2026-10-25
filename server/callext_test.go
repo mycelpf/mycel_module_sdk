@@ -71,14 +71,14 @@ func TestCallExtReportsAnUnwiredExtension(t *testing.T) {
 
 // The degradation this hardening exists for: an extension that is momentarily
 // unreachable used to fail the call outright, and IAM's best-effort call site then minted
-// an identity WITHOUT its enriched roles — silently. UNAVAILABLE means the request never
-// reached a server, so replaying it cannot double-apply anything.
+// an identity WITHOUT its enriched roles — silently. Only safe read methods may
+// retry: UNAVAILABLE can also be returned after processing a write.
 func TestCallExtRetriesAnUnavailableExtension(t *testing.T) {
 	quietLog(t)
 	es := &extServer{failWith: codes.Unavailable, failFirst: 1}
 	startExt(t, "MYCEL_TEST_EXT_URL", es)
 
-	status, _, configured, err := callExt(context.Background(), "MYCEL_TEST_EXT_URL", "POST", "/_enrich_identity", nil)
+	status, _, configured, err := callExt(context.Background(), "MYCEL_TEST_EXT_URL", "GET", "/identity", nil)
 	if err != nil {
 		t.Fatalf("a blip was not retried: %v", err)
 	}

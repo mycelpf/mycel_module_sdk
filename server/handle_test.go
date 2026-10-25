@@ -90,7 +90,12 @@ func TestHandleReportsACommitFailureInsteadOfSuccess(t *testing.T) {
 	h := &handler{
 		d: modulesdk.Descriptor{
 			Token: "testmod",
-			Route: func(modulesdk.Request, modulesdk.Host) modulesdk.Response {
+			// The route WRITES: the transaction opens on first use, so a commit failure is
+			// only possible — and only matters — once the route has done something to lose.
+			Route: func(_ modulesdk.Request, host modulesdk.Host) modulesdk.Response {
+				if _, err := host.Exec("INSERT INTO things VALUES ($1)", []string{"a"}); err != nil {
+					return modulesdk.Response{Status: 500}
+				}
 				return modulesdk.Response{Status: 201, Body: `{"created":true}`}
 			},
 		},

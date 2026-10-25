@@ -1,0 +1,235 @@
+# Work items for the mycel_module_sdk v0.2 changes.
+# Design: mycel_app_core/_docs/design/v0.2/app_core_design_v0.2.sdk.md (S12 test IDs).
+# status: todo | red | green | blocked. test: package and test names.
+
+[[item]]
+id = "SDK-T1"
+section = "S1"
+tier = "integration"
+status = "green"
+test = "./contracts TestGenerationCheckPassesOnTheCheckoutAndDoesNotChangeIt, TestGenerationCheckFailsOnAChangedProtoWithStaleBindings, TestGenerationCheckFailsOnAnUnexpectedGeneratedFile, TestGenerationCheckFailsWhenAGeneratorIsMissing, TestGenerationCheckFailsOnAWrongGeneratorVersion"
+note = "The first three skip when the pinned protoc and plugins (contracts/tooling.versions) are not on PATH; CI must install them. _scripts/verify.sh fails without them."
+
+[[item]]
+id = "SDK-T2"
+section = "S1, S10"
+tier = "unit"
+status = "green"
+test = "./modulerpc/v1 TestOldAndCanonicalPackagesShareOneRegistration"
+note = ""
+
+[[item]]
+id = "SDK-T3"
+section = "S2"
+tier = "unit"
+status = "green"
+test = "./wire TestDiscoverySurvivesProtobufAndHostJSON"
+note = "Go half: pure data, protobuf and protojson. TypeScript half is the next item."
+
+[[item]]
+id = "SDK-T3"
+section = "S2"
+tier = "integration"
+status = "green"
+test = "./contracts/typescriptgeneration TestGeneratedTypeScriptMatchesTheContract, TestGeneratedTypeScriptCoversEveryField, TestDescriptorSurvivesTheTypeScriptValidator, TestTypeScriptValidatorRefusesWrongShapes; contracts/typescript npm test"
+note = "TypeScript half: generated from the compiled contract by contracts/typescriptgeneration; the cross-language tests skip when node is not on PATH (_scripts/verify.sh runs the npm check, build and test). Validation is structural (types, enums, integer ranges, base64); descriptor rules stay in Go ValidateDiscovery."
+
+[[item]]
+id = "SDK-T4"
+section = "S2, S5"
+tier = "unit"
+status = "green"
+test = ". TestInvalidTypedDescriptorsFail, TestTypedDescriptorWithAgreeingLegacyEntryPasses; ./wire TestOversizedDiscoveryMetadataFails, TestUnknownWireEnumsFailValidation"
+note = ""
+
+[[item]]
+id = "SDK-T5"
+section = "S2"
+tier = "unit"
+status = "green"
+test = ". TestResolveUI; ./wire TestLegacyAndAPIOnlyResponses"
+note = ""
+
+[[item]]
+id = "SDK-T6"
+section = "S2, license T12"
+tier = "unit"
+status = "green"
+test = ". TestValidateNeededMycelLicense, TestDescriptorValidationRefusesABadLicenseDeclaration; ./server TestBootRefusesAnInvalidLicenseDeclaration"
+note = "Release-validation half (mycel_k8s_release) uses ValidateNeededMycelLicense; not built here."
+
+[[item]]
+id = "SDK-T7"
+section = "S3"
+tier = "integration"
+status = "green"
+test = "./server TestDescribeAndHealthAnswerWhileVerificationIsPending, TestGatedHandleReturnsASafeEnvelope"
+note = ""
+
+[[item]]
+id = "SDK-T8"
+section = "S3"
+tier = "integration"
+status = "green"
+test = "./server TestShutdownCancelsARunningVerificationProbe, TestShutdownCancelsAVerificationBackoffWait, TestADelayedCollaboratorRecoversAndAttemptsHaveADeadline, TestVerificationHostCarriesCancellationToCallExt"
+note = ""
+
+[[item]]
+id = "SDK-T9"
+section = "S3"
+tier = "integration"
+status = "green"
+test = "./server TestBootRefusesMalformedDescriptorsWithoutRetrying"
+note = ""
+
+[[item]]
+id = "SDK-T10"
+section = "S3"
+tier = "integration"
+status = "green"
+test = "./server TestLicenseDeclarationDoesNotChangeProcessHealth"
+note = "SDK half only: the SDK never consults licensing. The app_core /healthz refusal half is CORE-T4 / license T13 in mycel_app_core."
+
+[[item]]
+id = "SDK-T11"
+section = "S4"
+tier = "unit"
+status = "green"
+test = ". TestNormalizeHeaderFieldsMergesNamesInOrder, TestLegacyHeaderMapTranslation; ./wire TestHeaderFieldsRoundTripLossless, TestLegacyNewlineSetCookieIsTranslated, TestHandleRequestHeadersFromHTTP; ./server TestRepeatedHeadersRoundTripThroughRoute, TestLegacyRouteSetCookieIsTranslated, TestRepeatedHeadersRoundTripThroughHandler, TestBinaryAndHTMLBodiesArePreserved"
+note = "SDK side. app_core still reads the legacy map (login D5); switching it to wire.HeaderFieldsFromHandleResponse and wire.HandleRequestHeaders is an app_core change."
+
+[[item]]
+id = "SDK-T12"
+section = "S4"
+tier = "unit"
+status = "green"
+test = ". TestHeaderValidationRefusesCRLFAndBadNames, TestModuleCannotWeakenHostSecurityHeaders; ./wire TestWireHeadersRefuseCRLF; ./server TestRequestWithCRLFHeaderIsRefused, TestResponseWithCRLFHeaderBecomesASafeError"
+note = "SDK side: modulesdk.ApplyModuleHeaders drops host security and hop-by-hop headers; app_core applies its policy afterwards. app_core adoption is an app_core change."
+
+[[item]]
+id = "SDK-T13"
+section = "S5"
+tier = "unit"
+status = "green"
+test = "./wire TestRequestBudgetBoundaries, TestResponseBudgetBoundaries; ./server TestOversizedRequestIsRefusedBeforeDispatch, TestOversizedResponseRollsBackAndAnswers502Once"
+note = "SDK side: budgets published as modulesdk constants and wire.CheckHandleRequestBudget/CheckHandleResponseBudget; an oversized response rolls back its transaction. Asset build-tool checks (large lazy chunk) belong to the kit build (UX U14)."
+
+[[item]]
+id = "SDK-T14"
+section = "S6"
+tier = "unit"
+status = "green"
+test = ". TestValidateOpenAPI, TestFederateOpenAPIRefusesDuplicates, TestTypedDescriptorValidatesOpenAPI; ./server TestFederatedOperationsResolveToDispatchedPaths, TestBootRefusesATypedModuleWithAnUnprefixedOpenAPIPath"
+note = "modulesdk.ValidateOpenAPI and FederateOpenAPI. Enforced at boot for typed (schema 1) modules; a legacy module only logs a warning. app_core federation adoption is an app_core change."
+
+[[item]]
+id = "SDK-T15"
+section = "S7"
+tier = "integration"
+status = "green"
+test = "./server TestTypedModuleRefusesHostReservedVariables, TestTypedModuleFailsBootWhenNonDumpableFails, TestLegacyModuleKeepsItsCurrentBoot, TestMarkNonDumpableOnLinux"
+note = "TestMarkNonDumpableOnLinux runs on linux only. 'Child environment holds only declared variables' is the supervisor's job (CORE-T5, mycel_app_core)."
+
+[[item]]
+id = "SDK-T16"
+section = "S7"
+tier = "integration"
+status = "green"
+test = "./server TestReleaseBoundaryRefusesTCPForTypedModules, TestShutdownOrder"
+note = ""
+
+[[item]]
+id = "SDK-T17"
+section = "S7"
+tier = "unit"
+status = "green"
+test = "./server TestHandleOpensOneSchemaScopedTransactionOnFirstUse, TestHandleRollsBackWritesWhenTheRouteFails, TestHandleReleasesTheTransactionWhenTheRoutePanics, TestHandleReportsACommitFailureInsteadOfSuccess"
+note = "Existing suites, re-run unchanged."
+
+[[item]]
+id = "SDK-T18"
+section = "S8"
+tier = "unit"
+status = "green"
+test = ". TestErrorResponseCarriesTheEnvelope, TestDecodeErrorEnvelope, TestTraceIDFromHeadersRefusesMalformedValues; ./server TestServerErrorsUseTheEnvelope, TestGatedHandleReturnsASafeEnvelope, TestRedactCredentials, TestErrResponse"
+note = ""
+
+[[item]]
+id = "SDK-T19"
+section = "S11.1"
+tier = "unit"
+status = "green"
+test = "./wire TestRouteClassesSurviveProtobufAndHostJSON; ./server TestDescribeCarriesRouteClassesAndNavigationGroups"
+note = ""
+
+[[item]]
+id = "SDK-T20"
+section = "S11.1"
+tier = "unit"
+status = "green"
+test = ". TestInvalidRouteClassesFail, TestValidRouteClassesPass; ./server TestBootRefusesAnInvalidRouteClass"
+note = ""
+
+[[item]]
+id = "SDK-T21"
+section = "S11.2"
+tier = "unit"
+status = "green"
+test = ". TestNavigationGroupValidation; ./wire TestNavigationGroupsOnTheWire; ./server TestDescribeCarriesRouteClassesAndNavigationGroups"
+note = ""
+
+[[item]]
+id = "SDK-T22"
+section = "S11.3"
+tier = "integration"
+status = "green"
+test = "./server TestStartRunsOnceAfterVerificationAndBeforeServing, TestStartFailureExitsNonZero"
+note = ""
+
+[[item]]
+id = "SDK-T23"
+section = "S11.3, S7"
+tier = "integration"
+status = "green"
+test = "./server TestShutdownOrder"
+note = ""
+
+[[item]]
+id = "SDK-T24"
+section = "S11.4"
+tier = "unit"
+status = "green"
+test = "./server TestVerifiedUserReachesBothAdapters; ./analytics TestWithRequest; ./wire TestUserConversion"
+note = ""
+
+[[item]]
+id = "SDK-T25"
+section = "S11.4"
+tier = "unit"
+status = "green"
+test = "./server TestIdentityHeaderNeverBecomesAUser; ./analytics TestWithHeaders, TestWithRequest"
+note = ""
+
+[[item]]
+id = "SDK-T26"
+section = "S11, core T11"
+tier = "unit"
+status = "green"
+test = "./server TestOneRouteDispatchesToComponentsWithATransactionEach"
+note = ""
+
+[[item]]
+id = "SDK-D4"
+section = "Implementation decisions D4"
+tier = "unit"
+status = "green"
+test = "./server TestRouteReceivesTheRequestContext, TestRouteContextIsCancelledWithTheCall; . TestRequestContextDefaultsToBackground"
+note = "Request.Context() carries the gRPC call context into RouteFunc; RouteFunc keeps its signature."
+
+[[item]]
+id = "SDK-SR1-NS"
+section = "S11.1, login route admission matrix"
+tier = "unit"
+status = "green"
+test = ". TestNetworkServiceRouteClass; ./wire TestRouteClassesSurviveProtobufAndHostJSON"
+note = "ROUTE_CLASS_NETWORK_SERVICE for login's network-service row; unblocks LOGIN-T14 in mycel_app_core."

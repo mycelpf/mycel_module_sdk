@@ -8,6 +8,8 @@ package mycel.modulerpc.v1;
 
 option go_package = "github.com/mycelpf/mycel_module_sdk/contracts/modulerpc/v1;modulerpc";
 
+import "contracts/modulerpc/v1/ui_contract.proto";
+
 // Implemented by EVERY downstream service module.
 service ModuleHandler {
   // Self-description: token, nav, menu-group, capabilities, contract version.
@@ -29,30 +31,112 @@ message DescribeResponse {
   repeated NavEntry nav   = 4;    // sidebar links, paths relative to /m/<token>
   repeated string capabilities = 5;
   string ui_entry         = 6;    // optional: module-declared UI bundle path (else from the resolved composition)
-  // The module's own OpenAPI 3.x document (JSON), with paths relative to its root
-  // (no /m/<token> prefix — the host namespaces them when it federates). Empty when
-  // the module ships no spec; the host then falls back to a generic passthrough op.
+  // The module's own OpenAPI 3.x document (JSON). Paths are complete host-visible paths,
+  // already prefixed with /m/<token>; the host merges them verbatim when it federates
+  // (sdk.md S6). Empty when the module ships no spec; the host then falls back to a
+  // generic passthrough operation.
   bytes openapi           = 7;
+
+  // 0: legacy descriptor (only the host's legacy adapter may infer a UI from ui_entry).
+  // 1: v0.2 typed declaration; an absent `ui` then means the module has no UI.
+  // Any other value fails compatibility validation (sdk.md S2).
+  uint32 descriptor_schema_major = 8;
+  // Typed UI declaration (UX A10/A11). Only meaningful with descriptor_schema_major = 1.
+  UIDescriptor ui = 9;
+  // Product IDs from the license catalog that must all be granted (license §5.2, core
+  // I21). Compiled into the module binary; empty means no license is needed.
+  repeated string needed_mycel_license = 10;
+  // Route-class declarations (sdk.md S11.1). app_core accepts them only from mycel_iam.
+  repeated RouteClassDeclaration route_classes = 11;
 }
 
 message NavEntry {
   string label = 1;
   string path  = 2;   // relative to /m/<token>
+  // Menu group for this entry (sdk.md S11.2). Absent: the module's menu_group.
+  // Present: must be non-empty after trimming spaces.
+  optional string group = 3;
+}
+
+// Route classes app_core uses for its admission matrix (sdk.md S11.1, login B1).
+enum RouteClass {
+  ROUTE_CLASS_UNSPECIFIED       = 0;
+  ROUTE_CLASS_IAM_SIGNIN        = 1;  // sign-in initiation, callback and signed-out pages
+  ROUTE_CLASS_IAM_AUTHORIZATION = 2;  // /oauth/authorize
+  ROUTE_CLASS_IAM_TOKEN         = 3;  // /oauth/token and /oauth/check
+  ROUTE_CLASS_IAM_KEY_SET       = 4;  // the published key set
+  // A provisioned network-service route (login route admission matrix, core I9, T3): no
+  // user context; deployment configuration must still allowlist it and isolate the network.
+  ROUTE_CLASS_NETWORK_SERVICE   = 5;
+}
+
+message RouteClassDeclaration {
+  string     method = 1;  // GET or POST
+  string     path   = 2;  // complete host-visible path, exact match
+  RouteClass class  = 3;
+}
+
+// The verified user app_core attaches to a request (sdk.md S11.4, login §8). Present only
+// when app_core verified a user credential for this request; never built from a header.
+// IAM-owned exact grants. This is transported only on the authenticated host/module socket.
+// A missing or unknown version never grants protected access.
+message PermissionGrant {
+  string permission = 1;
+  string resource = 2;
+}
+
+message AuthorizedContext {
+  uint32 version = 1;
+  string issuer = 2;
+  string subject = 3;
+  string account = 4;
+  string application = 5;
+  string audience = 6;
+  string policy_version = 7;
+  int64 not_before = 8;
+  int64 expires_at = 9;
+  repeated PermissionGrant grants = 10;
+}
+
+message UserContext {
+  string          sub    = 1;
+  string          email  = 2;
+  repeated string roles  = 3;
+  string          tenant = 4;
+  AuthorizedContext access = 5;
+}
+
+// One header name with all of its values in order (sdk.md S4). The name is lower case.
+// Values never contain CR, LF or NUL. Set-Cookie keeps one value per cookie.
+message HeaderField {
+  string          name   = 1;
+  repeated string values = 2;
 }
 
 message HandleRequest {
   string method = 1;
   string path   = 2;                 // path under /m/<token> (prefix already stripped by host)
   string query  = 3;
+  // Legacy single-value headers (repeated values joined). Produced and read only by the
+  // named compatibility adapter; header_fields is authoritative when present (sdk.md S4).
   map<string,string> headers = 4;
   bytes  body   = 5;
-  // tenant identity + trace context travel in gRPC METADATA, never in the body.
+  // trace context travels in gRPC METADATA, never in the body.
+  // The verified user (sdk.md S11.4). Absent on public and network-service routes.
+  UserContext user = 6;
+  // Every request header with all of its values, in order (sdk.md S4).
+  repeated HeaderField header_fields = 7;
 }
 
 message HandleResponse {
   uint32 status = 1;
+  // Legacy single-value headers: repeated values joined with ", ", and several Set-Cookie
+  // values joined with a newline. Kept for hosts that predate header_fields; a host reads
+  // header_fields when present (sdk.md S4).
   map<string,string> headers = 2;
   bytes  body   = 3;
+  // Every response header with all of its values, in order (sdk.md S4).
+  repeated HeaderField header_fields = 4;
 }
 
 message HealthRequest {}

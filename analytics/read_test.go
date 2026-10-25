@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	modulesdk "github.com/mycelpf/mycel_module_sdk"
 )
 
 // readTransport answers GET /kpi/{key} with a scripted status and body, and records the
@@ -158,7 +160,8 @@ func TestWithHeaders(t *testing.T) {
 		name, traceparent, user string
 		wantTrace, wantActor    string
 	}{
-		{"valid", valid, `{"sub":"user-1","email":"a@b.c"}`, "4bf92f3577b34da6a3ce929d0e0e4736", "user-1"},
+		// SDK-T25 (sdk.md S11.4): the actor never comes from a header any more.
+		{"valid", valid, `{"sub":"user-1","email":"a@b.c"}`, "4bf92f3577b34da6a3ce929d0e0e4736", ""},
 		{"missing", "", "", "", ""},
 		{"malformed", "not-a-traceparent", "", "", ""},
 		{"short trace id", "00-abc-def-01", "", "", ""},
@@ -166,7 +169,7 @@ func TestWithHeaders(t *testing.T) {
 		// it links the event into somebody else's trace.
 		{"all zero", "00-00000000000000000000000000000000-00f067aa0ba902b7-01", "", "", ""},
 		{"non-hex", "00-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-00f067aa0ba902b7-01", "", "", ""},
-		{"actor by email only", "", `{"email":"a@b.c"}`, "", "a@b.c"},
+		{"header with email only", "", `{"email":"a@b.c"}`, "", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -192,6 +195,32 @@ func TestWithHeadersDoesNotOverwriteExplicitValues(t *testing.T) {
 		})
 	if e.ActorID != "explicit" || e.TraceID != "deadbeefdeadbeefdeadbeefdeadbeef" {
 		t.Errorf("explicit values were overwritten: %+v", e)
+	}
+}
+
+// SDK-T24/SDK-T25 (sdk.md S11.4): WithRequest takes the actor from the verified user
+// field and the trace from the traceparent; a request without a user has no actor even
+// when it carries an x-mycel-user header.
+func TestWithRequest(t *testing.T) {
+	headers := map[string]string{
+		"traceparent":  "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+		"x-mycel-user": `{"sub":"forged"}`,
+	}
+	verified := Event{Type: "T"}.WithRequest(modulesdk.Request{Headers: headers, User: modulesdk.User{Sub: "user-1", Email: "a@b.c"}})
+	if verified.ActorID != "user-1" || verified.TraceID != "4bf92f3577b34da6a3ce929d0e0e4736" {
+		t.Errorf("verified request: %+v", verified)
+	}
+	emailOnly := Event{Type: "T"}.WithRequest(modulesdk.Request{User: modulesdk.User{Email: "a@b.c"}})
+	if emailOnly.ActorID != "a@b.c" {
+		t.Errorf("email-only user: ActorID = %q", emailOnly.ActorID)
+	}
+	anonymous := Event{Type: "T"}.WithRequest(modulesdk.Request{Headers: headers})
+	if anonymous.ActorID != "" {
+		t.Errorf("an x-mycel-user header became the actor %q", anonymous.ActorID)
+	}
+	explicit := Event{ActorID: "explicit"}.WithRequest(modulesdk.Request{User: modulesdk.User{Sub: "user-1"}})
+	if explicit.ActorID != "explicit" {
+		t.Errorf("an explicit actor was overwritten: %q", explicit.ActorID)
 	}
 }
 

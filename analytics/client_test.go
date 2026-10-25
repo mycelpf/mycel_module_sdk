@@ -3,8 +3,10 @@ package analytics
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -313,24 +315,78 @@ func TestShutdownDrainsTheQueue(t *testing.T) {
 }
 
 func TestShutdownDeadlineReportsUndeliveredCount(t *testing.T) {
-	tr := &fakeTransport{block: make(chan struct{})}
-	c := newTestClient(t, tr, map[string]string{
-		envDepth: "500", envBatch: "1000", envFlushMS: "3600000",
-	})
-	for i := 0; i < 7; i++ {
-		c.Emit(Event{Type: "T", SubjectType: "s", SubjectID: strconv.Itoa(i)})
+	for _, tc := range []struct {
+		name      string
+		batchSize string
+		events    int
+	}{
+		{name: "whole queue becomes one in-flight batch", batchSize: "1000", events: 7},
+		{name: "in-flight batch plus queued remainder", batchSize: "2", events: 7},
+		{name: "single in-flight event", batchSize: "1", events: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := &fakeTransport{block: make(chan struct{})}
+			c := newTestClient(t, tr, map[string]string{
+				envDepth: "500", envBatch: tc.batchSize, envFlushMS: "3600000",
+			})
+			for i := 0; i < tc.events; i++ {
+				c.Emit(Event{Type: "T", SubjectType: "s", SubjectID: strconv.Itoa(i)})
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+			defer cancel()
+			err := c.Shutdown(ctx)
+			if err == nil {
+				t.Fatal("expected an error naming the undelivered events")
+			}
+			// The count is the only remaining record that these events existed.
+			want := fmt.Sprintf("%d event(s) undelivered", tc.events)
+			if !contains(err.Error(), want) {
+				t.Errorf("error %q does not report the count (%q)", err, want)
+			}
+			close(tr.block)
+		})
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
-	defer cancel()
-	err := c.Shutdown(ctx)
-	if err == nil {
-		t.Fatal("expected an error naming the undelivered events")
+}
+
+func TestShutdownDeadlineExcludesPreviouslyAccountedBatches(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		status     uint16
+		configured bool
+	}{
+		{name: "sent", status: 200, configured: true},
+		{name: "permanently rejected", status: 400, configured: true},
+		{name: "discarded when target disappears", configured: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(envURL, "configured-for-test")
+			t.Setenv(envBatch, "1")
+			releaseSecond := make(chan struct{})
+			var calls atomic.Int64
+			transport := func(ctx context.Context, _, _, _ string, _ []byte) (uint16, []byte, bool, error) {
+				if calls.Add(1) == 1 {
+					return tc.status, nil, tc.configured, nil
+				}
+				select {
+				case <-releaseSecond:
+					return 200, nil, true, nil
+				case <-ctx.Done():
+					return 0, nil, true, ctx.Err()
+				}
+			}
+			c := New(Config{Service: "test", Transport: transport, Log: func(string, string) {}})
+			c.Emit(Event{Type: "T", SubjectType: "s", SubjectID: "accounted"})
+			waitFor(t, func() bool { return calls.Load() >= 1 && c.inFlight.Load() == 0 }, "first batch to be accounted")
+			c.Emit(Event{Type: "T", SubjectType: "s", SubjectID: "pending"})
+			ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+			defer cancel()
+			err := c.Shutdown(ctx)
+			if err == nil || !contains(err.Error(), "1 event(s) undelivered") {
+				t.Fatalf("Shutdown error = %v, want exactly one pending event", err)
+			}
+			close(releaseSecond)
+		})
 	}
-	// The count is the only remaining record that these events existed.
-	if want := "7 event(s) undelivered"; !contains(err.Error(), want) {
-		t.Errorf("error %q does not report the count (%q)", err, want)
-	}
-	close(tr.block)
 }
 
 func TestEmitDuringShutdownDoesNotPanic(t *testing.T) {
